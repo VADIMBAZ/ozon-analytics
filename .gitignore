@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.numbers
+*.xlsx
+*.bak
+~$*
+.venv/
+.venv-container/
+.playwright-mcp/
