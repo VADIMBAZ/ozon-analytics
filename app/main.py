@@ -9,6 +9,8 @@ from plotly.subplots import make_subplots
 
 from services.loader import load_sales, load_analytics
 
+COST_PER_UNIT = 25  # себестоимость, ₽/шт
+
 st.set_page_config(page_title='Ozon Аналитика', layout='wide', page_icon='📦')
 
 st.markdown("""
@@ -105,7 +107,7 @@ if not selected:
     st.warning('Выберите хотя бы один артикул.')
     st.stop()
 
-st.title('📦 Спутник Ключи — Аналитика Ozon')
+st.markdown('<h1 style="text-align:center">📦 Спутник Ключи — Аналитика Ozon</h1>', unsafe_allow_html=True)
 
 # ── KPI ─────────────────────────────────────────────────────────────────────
 
@@ -115,13 +117,36 @@ cancelled_all = sales[sales['Статус'] == 'Отменён']
 delivered_sel = delivered_all[delivered_all['Артикул'].isin(selected)]
 cancelled_sel = cancelled_all[cancelled_all['Артикул'].isin(selected)]
 total_orders = sales[sales['Артикул'].isin(selected)]['Количество'].sum()
+revenue = delivered_sel['Оплачено покупателем'].sum()
+
+# Дельты к прошлому месяцу
+_sel_sales = sales[sales['Артикул'].isin(selected)].copy()
+_sel_sales['_month'] = _sel_sales['date'].dt.to_period('M')
+_months_sorted = sorted(_sel_sales['_month'].dropna().unique())
+if len(_months_sorted) >= 2:
+    _last_m, _prev_m = _months_sorted[-1], _months_sorted[-2]
+    _cur = _sel_sales[_sel_sales['_month'] == _last_m]
+    _prv = _sel_sales[_sel_sales['_month'] == _prev_m]
+    _cur_dlv = _cur[_cur['Статус'] == 'Доставлен']
+    _prv_dlv = _prv[_prv['Статус'] == 'Доставлен']
+    _cur_canc = _cur[_cur['Статус'] == 'Отменён']
+    _prv_canc = _prv[_prv['Статус'] == 'Отменён']
+    _d_orders = int(_cur['Количество'].sum() - _prv['Количество'].sum())
+    _d_dlv = int(_cur_dlv['Количество'].sum() - _prv_dlv['Количество'].sum())
+    _d_canc = int(_cur_canc['Количество'].sum() - _prv_canc['Количество'].sum())
+    _d_rev = _cur_dlv['Оплачено покупателем'].sum() - _prv_dlv['Оплачено покупателем'].sum()
+    _d_orders_s = f"{_d_orders:+,}".replace(',', ' ')
+    _d_dlv_s = f"{_d_dlv:+,}".replace(',', ' ')
+    _d_canc_s = f"{_d_canc:+,}".replace(',', ' ')
+    _d_rev_s = f"{_d_rev:+,.0f} ₽".replace(',', ' ')
+else:
+    _d_orders_s = _d_dlv_s = _d_canc_s = _d_rev_s = None
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric('Всего заказано', f"{int(total_orders):,}".replace(',', ' '))
-col2.metric('Доставлено', f"{int(delivered_sel['Количество'].sum()):,}".replace(',', ' '))
-col3.metric('Отменено', f"{int(cancelled_sel['Количество'].sum()):,}".replace(',', ' '))
-revenue = delivered_sel['Оплачено покупателем'].sum()
-col4.metric('Выручка (доставл.)', f"{revenue:,.0f} ₽".replace(',', ' '))
+col1.metric('Всего заказано', f"{int(total_orders):,}".replace(',', ' '), delta=_d_orders_s)
+col2.metric('Доставлено', f"{int(delivered_sel['Количество'].sum()):,}".replace(',', ' '), delta=_d_dlv_s)
+col3.metric('Отменено', f"{int(cancelled_sel['Количество'].sum()):,}".replace(',', ' '), delta=_d_canc_s, delta_color='inverse')
+col4.metric('Выручка (доставл.)', f"{revenue:,.0f} ₽".replace(',', ' '), delta=_d_rev_s)
 
 st.divider()
 
@@ -202,28 +227,34 @@ def build_insights(sales_df, analytics_df, selected_arts):
                 f"(средний по артикулам: {avg_rate:.0f}%). Возможная причина: описание, фото или сроки доставки."
             )
 
-    # ── Стокаут-потери ──
-    avg_days = an.groupby('Артикул')['дней_без_остатка'].mean()
-    stockout_arts = avg_days[avg_days > 15].sort_values(ascending=False)
-    if not stockout_arts.empty:
-        for worst in stockout_arts.index[:2]:
-            worst_days = stockout_arts[worst]
-            art_monthly = an[an['Артикул'] == worst].sort_values('period_start')
-            if len(art_monthly) >= 2:
-                peak_row = art_monthly.loc[art_monthly['Доставлено'].idxmax()]
-                last_row = art_monthly.iloc[-1]
-                drop = int(peak_row['Доставлено']) - int(last_row['Доставлено'])
-                if drop > 0:
-                    avg_price = avg_check_by_art.get(worst, 0)
-                    lost_rev = drop * avg_price
-                    lost_str = f" Упущенная выручка: ~{_fmt(lost_rev)} ₽/мес." if avg_price > 0 else ""
-                    insights.append(
-                        f"⚠️ **{worst} — стокаут съел продажи**: "
-                        f"пик {_fmt(peak_row['Доставлено'])} шт в {peak_row['month_label']}, "
-                        f"сейчас {_fmt(last_row['Доставлено'])} шт в {last_row['month_label']} "
-                        f"(−{_fmt(drop)} шт, −{drop / int(peak_row['Доставлено']) * 100:.0f}%). "
-                        f"Без остатка в среднем {worst_days:.0f} из 28 дней.{lost_str}"
-                    )
+    # ── Стокаут-потери (по остатку на конец периода) ──
+    # Средние продажи за нормальные месяцы (остаток >= продаж)
+    for art in selected_arts:
+        art_an = an[an['Артикул'] == art].sort_values('period_start')
+        if len(art_an) < 2:
+            continue
+        normal_dlv = []
+        for _, r in art_an.iterrows():
+            if pd.notna(r['остаток_конец']) and pd.notna(r['Доставлено']) and r['Доставлено'] > 0:
+                if r['остаток_конец'] >= r['Доставлено']:
+                    normal_dlv.append(r['Доставлено'])
+        avg_sales = sum(normal_dlv) / len(normal_dlv) if normal_dlv else 0
+        if avg_sales <= 0:
+            continue
+        last_row = art_an.iloc[-1]
+        last_stock = last_row['остаток_конец']
+        last_dlv = last_row['Доставлено'] if pd.notna(last_row['Доставлено']) else 0
+        if pd.notna(last_stock) and last_stock < avg_sales and last_dlv < avg_sales * 0.5:
+            missed = int(avg_sales - last_dlv)
+            avg_price = avg_check_by_art.get(art, 0)
+            lost_rev = missed * avg_price
+            lost_str = f" Упущенная выручка: ~{_fmt(lost_rev)} ₽/мес." if avg_price > 0 else ""
+            insights.append(
+                f"⚠️ **{art} — стокаут съел продажи**: "
+                f"средние продажи {avg_sales:.0f} шт/мес, "
+                f"в {last_row['month_label']} продано {_fmt(last_dlv)} шт (остаток {_fmt(last_stock)} шт). "
+                f"Недопродано ~{_fmt(missed)} шт.{lost_str}"
+            )
 
     # ── Восстановление после пополнения ──
     if an.empty or 'period_start' not in an.columns:
@@ -297,25 +328,13 @@ title_col, info_col = st.columns([10, 1])
 title_col.subheader('Динамика продаж')
 with info_col.popover('ℹ️'):
     st.markdown("""
-**Верхний график — Доставлено, шт**
+**Динамика продаж — Доставлено, шт**
 
 Линии показывают количество доставленных товаров по каждому артикулу за период (неделя/месяц).
 
-🔴 **Красные зоны** на фоне — периоды массового стокаута (в среднем >15 дней без остатка). Падение линии в красной зоне = потерянные продажи из-за отсутствия товара.
+**Итого** (жирная линия) — суммарные продажи по всем выбранным артикулам.
 
----
-
-**Нижний график — Дней без остатка из 28**
-
-Тепловая карта: каждая ячейка — сколько дней в месяце артикул был **недоступен** (0 остаток на складе).
-
-| Цвет | Значение |
-|------|----------|
-| 🟢 Зелёный | 0–5 дней — норма |
-| 🟡 Жёлтый | 6–15 дней — проблемы с поставкой |
-| 🔴 Красный | 16–28 дней — критический стокаут |
-
-**Как читать:** если ячейка красная с числом 25 — товар отсутствовал 25 из 28 дней, продажи почти остановились.
+Дельты в KPI показывают изменение за последний месяц по сравнению с предыдущим.
 """)
 
 
@@ -340,12 +359,6 @@ pivot_heat = analytics_sel.pivot_table(
     values='дней_без_остатка', aggfunc='first'
 ).reindex(columns=month_order).reindex([a for a in all_articles if a in selected])
 
-# Зоны стокаутов для фона графика 1 (усреднённые по выбранным артикулам)
-stockout_zones = (
-    analytics_sel.groupby(['period_start', 'period_end'])['дней_без_остатка']
-    .mean()
-    .reset_index()
-)
 
 COLORS = [
     '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -356,18 +369,23 @@ COLORS = [
 # График продаж (без subplot — отдельный)
 fig = go.Figure()
 
-# Фон-зоны стокаутов
-for _, z in stockout_zones.iterrows():
-    if z['дней_без_остатка'] >= 15:
-        opacity = min(0.25, z['дней_без_остатка'] / 28 * 0.35)
-        fig.add_vrect(
-            x0=z['period_start'], x1=z['period_end'],
-            fillcolor=f'rgba(220,50,50,{opacity:.2f})',
-            layer='below', line_width=0,
-        )
-
-# Линии продаж (порядок по продажам)
+# Линия «Итого» — жирная, поверх остальных
 selected_sorted = [a for a in all_articles if a in selected]
+total_data = grouped[grouped['Артикул'].isin(selected)].groupby('period')['Количество'].sum().reset_index().sort_values('period')
+if len(selected_sorted) > 1:
+    fig.add_trace(
+        go.Scatter(
+            x=total_data['period'],
+            y=total_data['Количество'],
+            name='Итого',
+            mode='lines+markers',
+            line=dict(width=3.5, color='#333', dash='solid'),
+            marker=dict(size=6, symbol='diamond'),
+            opacity=0.85,
+        ),
+    )
+
+# Линии продаж по артикулам (тоньше)
 for i, art in enumerate(selected_sorted):
     art_data = grouped[grouped['Артикул'] == art].sort_values('period')
     fig.add_trace(
@@ -376,8 +394,9 @@ for i, art in enumerate(selected_sorted):
             y=art_data['Количество'],
             name=art,
             mode='lines+markers',
-            line=dict(width=2, color=COLORS[i % len(COLORS)]),
-            marker=dict(size=5),
+            line=dict(width=1.5, color=COLORS[i % len(COLORS)]),
+            marker=dict(size=4),
+            opacity=0.7,
         ),
     )
 
@@ -651,7 +670,6 @@ for _, row in last_month_an.iterrows():
         price_per = total_rev / total_qty if total_qty > 0 else 0
     else:
         price_per = 0
-    COST_PER_UNIT = 25
     frozen = stock * price_per
     frozen_cost = stock * COST_PER_UNIT
     stock_cards[art] = {
@@ -663,8 +681,19 @@ for _, row in last_month_an.iterrows():
         'price': price_per,
     }
 
-# Сортировка по замороженным деньгам
-sorted_cards = sorted(stock_cards.items(), key=lambda x: x[1]['frozen'], reverse=True)
+# Сортировка: сначала перезатарка (>6 мес), потом избыток (3-6), потом норма (<3)
+# Внутри группы — по замороженным деньгам
+def _card_sort_key(item):
+    m = item[1]['months']
+    if m > 6:
+        priority = 0  # перезатарка — наверх
+    elif m > 3:
+        priority = 1  # избыток
+    else:
+        priority = 2  # норма
+    return (priority, -item[1]['frozen'])
+
+sorted_cards = sorted(stock_cards.items(), key=_card_sort_key)
 
 # Сводка «Заморожено в товаре» — наверху раздела
 total_frozen = sum(d['frozen'] for _, d in sorted_cards)
@@ -685,7 +714,7 @@ st.markdown(
     f'<div style="font-size:28px;font-weight:800;color:#e74c3c">{_fmt(total_frozen)} ₽</div>'
     f'</div>'
     f'<div style="text-align:center;flex:1;min-width:140px">'
-    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Себестоимость (25 ₽/шт)</div>'
+    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Себестоимость ({COST_PER_UNIT} ₽/шт)</div>'
     f'<div style="font-size:28px;font-weight:800;color:#2980b9">{_fmt(total_frozen_cost)} ₽</div>'
     f'</div>'
     f'<div style="text-align:center;flex:1;min-width:140px">'
@@ -747,18 +776,74 @@ for row_start in range(0, len(sorted_cards), 3):
 
 st.divider()
 
+# ── % отмен по артикулам ────────────────────────────────────────────────────
+
+st.subheader('📊 Процент отмен по артикулам')
+
+_orders_by_art = sales[sales['Артикул'].isin(selected)].groupby('Артикул')['Количество'].sum()
+_canc_by_art = cancelled_sel.groupby('Артикул')['Количество'].sum()
+cancel_data = []
+for art in selected_sorted:
+    total_ord = _orders_by_art.get(art, 0)
+    total_canc = _canc_by_art.get(art, 0)
+    rate = (total_canc / total_ord * 100) if total_ord > 0 else 0
+    cancel_data.append({'art': art, 'rate': rate, 'cancelled': total_canc, 'total': total_ord})
+
+cancel_data.sort(key=lambda x: x['rate'], reverse=True)
+
+fig_canc = go.Figure()
+colors_canc = ['#e74c3c' if d['rate'] > 15 else '#f39c12' if d['rate'] > 10 else '#2ecc71' for d in cancel_data]
+fig_canc.add_trace(go.Bar(
+    x=[d['art'] for d in cancel_data],
+    y=[d['rate'] for d in cancel_data],
+    marker_color=colors_canc,
+    text=[f"{d['rate']:.1f}%<br>({int(d['cancelled'])} шт)" for d in cancel_data],
+    textposition='outside',
+    textfont_size=11,
+))
+avg_cancel = sum(d['rate'] for d in cancel_data) / len(cancel_data) if cancel_data else 0
+fig_canc.add_hline(y=avg_cancel, line_dash='dash', line_color='#888',
+                   annotation_text=f'Среднее: {avg_cancel:.1f}%', annotation_position='top left')
+fig_canc.update_layout(
+    height=300,
+    yaxis_title='% отмен',
+    margin=dict(t=20, b=20),
+    showlegend=False,
+)
+st.plotly_chart(fig_canc, use_container_width=True)
+
+st.divider()
+
 # ── Сводная таблица ──────────────────────────────────────────────────────────
 
 with st.expander('Сводная таблица по месяцам'):
     tbl = (
         analytics_sel[['month_label', 'Артикул', 'Заказано', 'Доставлено',
-                        'Отменено', 'дней_без_остатка', 'остаток_конец']]
+                        'Отменено', 'остаток_конец']]
         .rename(columns={
             'month_label': 'Месяц',
-            'дней_без_остатка': 'Дней без остатка',
-            'остаток_конец': 'Остаток конец',
+            'остаток_конец': 'Остаток',
         })
         .sort_values(['Месяц', 'Артикул'])
         .reset_index(drop=True)
     )
-    st.dataframe(tbl, use_container_width=True, hide_index=True)
+    # Форматирование с цветовой индикацией
+    num_cols = ['Заказано', 'Доставлено', 'Отменено', 'Остаток']
+    for c in num_cols:
+        tbl[c] = pd.to_numeric(tbl[c], errors='coerce')
+
+    def _highlight_stock(val):
+        if pd.isna(val):
+            return ''
+        if val == 0:
+            return 'background-color: #ffcccc; color: #c0392b; font-weight: 700'
+        if val < 10:
+            return 'background-color: #fff3cd; color: #856404'
+        return ''
+
+    styled = (
+        tbl.style
+        .format({c: '{:,.0f}' for c in num_cols}, na_rep='—')
+        .map(_highlight_stock, subset=['Остаток'])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
