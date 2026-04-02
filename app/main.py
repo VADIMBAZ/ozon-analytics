@@ -399,15 +399,15 @@ with info_lost.popover('ℹ️'):
     st.markdown("""
 **Как считается:**
 
-Стокаут = месяц, где **остаток на конец периода = 0** (товар закончился).
+Стокаут = месяц, где **остаток на конец < средних продаж** (товар заканчивался).
 
 Для таких месяцев:
 
-`упущено = средние_продажи_за_нормальные_месяцы × средний_чек`
+`упущено = (средние_продажи − фактические_продажи) × средний_чек`
 
-«Нормальные месяцы» — те, где остаток на конец > 0 (товар был в наличии).
+**Средние продажи** считаются по «нормальным» месяцам — где остаток на конец ≥ продаж (товар не заканчивался, продажи не были ограничены стоком).
 
-Поле `дней_без_остатка` из выгрузки OZON **не используется** — оно часто содержит ошибки.
+Пример: средние продажи = 100 шт, а в марте продали только 4 шт (остаток 1) → упущено 96 шт × средний чек.
 """)
 
 # Средний чек по артикулу
@@ -431,6 +431,8 @@ pivot_dlv = analytics_sel.pivot_table(
 ).reindex(columns=month_order).reindex([a for a in all_articles if a in selected])
 
 # Рассчитываем упущенную выручку
+# Логика: если остаток_конец < средних_продаж → товар закончился раньше конца месяца
+# Упущено = (средние_продажи − фактические_продажи) × средний_чек
 lost_data = {}
 for art in selected_sorted:
     if art not in pivot_stock_end.index or art not in pivot_dlv.index:
@@ -440,25 +442,44 @@ for art in selected_sorted:
     dlv_row = pivot_dlv.loc[art]
     avg_check = _avg_check.get(art, 0)
 
-    # Средние продажи за «нормальные» месяцы (остаток > 0)
+    # Шаг 1: определяем «нормальные» месяцы — где остаток_конец >= продаж
+    # (товар не заканчивался, продажи не ограничены стоком)
+    all_dlv = []
+    for month in month_order:
+        stock_end = stock_row.get(month, None)
+        dlv_val = dlv_row.get(month, 0)
+        if pd.notna(dlv_val) and dlv_val > 0:
+            all_dlv.append(dlv_val)
+
+    # Средние продажи — берём из месяцев где остаток >= доставлено (товар не заканчивался)
     normal_months_dlv = []
     for month in month_order:
         stock_end = stock_row.get(month, None)
         dlv_val = dlv_row.get(month, 0)
-        if pd.notna(stock_end) and stock_end > 0 and pd.notna(dlv_val) and dlv_val > 0:
+        if pd.isna(dlv_val) or dlv_val <= 0:
+            continue
+        if pd.notna(stock_end) and stock_end >= dlv_val:
             normal_months_dlv.append(dlv_val)
 
     avg_monthly_sales = sum(normal_months_dlv) / len(normal_months_dlv) if normal_months_dlv else 0
 
-    # Считаем потери за месяцы со стокаутом
+    # Шаг 2: считаем потери
     art_lost = {}
     for month in month_order:
         stock_end = stock_row.get(month, None)
-        if pd.isna(stock_end) or stock_end > 0:
-            art_lost[month] = 0  # товар был — потерь нет
+        dlv_val = dlv_row.get(month, 0)
+        if pd.isna(dlv_val):
+            dlv_val = 0
+        if pd.isna(stock_end) or avg_monthly_sales <= 0:
+            art_lost[month] = 0
+            continue
+        # Если остаток на конец >= средних продаж — товар не заканчивался
+        if stock_end >= avg_monthly_sales:
+            art_lost[month] = 0
         else:
-            # остаток = 0 → стокаут, считаем упущенное
-            art_lost[month] = avg_monthly_sales * avg_check
+            # Товар заканчивался: упущено = недопроданное × средний чек
+            missed_sales = max(avg_monthly_sales - dlv_val, 0)
+            art_lost[month] = missed_sales * avg_check
 
     lost_data[art] = art_lost
 
@@ -521,16 +542,55 @@ top3 = [f'**{art}** — {_fmt(total)} ₽' for art, total in top_lost[:3] if tot
 if top3:
     st.caption('Топ потерь: ' + ' · '.join(top3))
 
-# ── График 2: Остатки на конец месяца ────────────────────────────────────────
+# ── График 2: Остатки на конец месяца + Приходы ────────────────────────────
 
-st.subheader('Остаток на конец месяца')
+st.subheader('Остаток на конец месяца и приходы')
 
 pivot_stock = analytics_sel.pivot_table(
     index='Артикул', columns='month_label',
     values='остаток_конец', aggfunc='first'
 ).reindex(columns=month_order).reindex(all_articles)
 
-fig2 = go.Figure()
+pivot_dlv_stock = analytics_sel.pivot_table(
+    index='Артикул', columns='month_label',
+    values='Доставлено', aggfunc='first'
+).reindex(columns=month_order).reindex(all_articles)
+
+# Рассчитываем приходы: приход = остаток_конец - остаток_предыдущего_месяца + доставлено
+# Порог: < 20 шт считаем шумом (возвраты, корректировки), а не реальной поставкой
+INCOMING_THRESHOLD = 20
+pivot_incoming = pd.DataFrame(index=pivot_stock.index, columns=month_order, dtype=float)
+for art in all_articles:
+    if art not in pivot_stock.index:
+        continue
+    for j, month in enumerate(month_order):
+        stock_end = pivot_stock.loc[art].get(month, None)
+        delivered = pivot_dlv_stock.loc[art].get(month, 0)
+        if pd.isna(stock_end):
+            pivot_incoming.loc[art, month] = None
+            continue
+        if pd.isna(delivered):
+            delivered = 0
+        if j == 0:
+            pivot_incoming.loc[art, month] = None
+        else:
+            prev_month = month_order[j - 1]
+            stock_prev = pivot_stock.loc[art].get(prev_month, None)
+            if pd.isna(stock_prev):
+                pivot_incoming.loc[art, month] = None
+            else:
+                incoming = stock_end - stock_prev + delivered
+                # Отсекаем шум: мелкие возвраты/корректировки — не поставки
+                pivot_incoming.loc[art, month] = incoming if incoming >= INCOMING_THRESHOLD else 0
+
+fig2 = make_subplots(
+    rows=2, cols=1,
+    shared_xaxes=True,
+    row_heights=[0.55, 0.45],
+    vertical_spacing=0.08,
+    subplot_titles=['Остаток на конец месяца', 'Приходы за месяц'],
+)
+
 for i, art in enumerate(all_articles):
     if art not in pivot_stock.index:
         continue
@@ -539,16 +599,31 @@ for i, art in enumerate(all_articles):
         x=month_order,
         y=pivot_stock.loc[art].values,
         marker_color=COLORS[i % len(COLORS)],
-    ))
+        legendgroup=art,
+    ), row=1, col=1)
+
+    incoming_vals = pivot_incoming.loc[art].values if art in pivot_incoming.index else []
+    fig2.add_trace(go.Bar(
+        name=art,
+        x=month_order,
+        y=incoming_vals,
+        marker_color=COLORS[i % len(COLORS)],
+        marker_line_width=1,
+        marker_line_color='white',
+        marker_opacity=0.7,
+        legendgroup=art,
+        showlegend=False,
+    ), row=2, col=1)
 
 fig2.update_layout(
     barmode='group',
-    height=320,
-    yaxis_title='шт',
+    height=520,
     hovermode='x unified',
     legend=dict(orientation='h', yanchor='bottom', y=1.02),
     margin=dict(t=40, b=20),
 )
+fig2.update_yaxes(title_text='шт', row=1, col=1)
+fig2.update_yaxes(title_text='шт', row=2, col=1)
 st.plotly_chart(fig2, use_container_width=True)
 
 # ── Анализ запасов (карточки) ────────────────────────────────────────────────
@@ -590,6 +665,37 @@ for _, row in last_month_an.iterrows():
 
 # Сортировка по замороженным деньгам
 sorted_cards = sorted(stock_cards.items(), key=lambda x: x[1]['frozen'], reverse=True)
+
+# Сводка «Заморожено в товаре» — наверху раздела
+total_frozen = sum(d['frozen'] for _, d in sorted_cards)
+total_frozen_cost = sum(d['frozen_cost'] for _, d in sorted_cards)
+total_diff = total_frozen - total_frozen_cost
+total_stock = sum(d['stock'] for _, d in sorted_cards)
+
+st.markdown(
+    f'<div style="background:linear-gradient(135deg,#f8f9ff,#eef1ff);border:1px solid #d0d5f0;'
+    f'border-radius:14px;padding:20px 28px;margin-bottom:20px">'
+    f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">'
+    f'<div style="text-align:center;flex:1;min-width:140px">'
+    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Всего на складе</div>'
+    f'<div style="font-size:28px;font-weight:800;color:#333">{_fmt(total_stock)} шт</div>'
+    f'</div>'
+    f'<div style="text-align:center;flex:1;min-width:140px">'
+    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Розничная цена</div>'
+    f'<div style="font-size:28px;font-weight:800;color:#e74c3c">{_fmt(total_frozen)} ₽</div>'
+    f'</div>'
+    f'<div style="text-align:center;flex:1;min-width:140px">'
+    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Себестоимость (25 ₽/шт)</div>'
+    f'<div style="font-size:28px;font-weight:800;color:#2980b9">{_fmt(total_frozen_cost)} ₽</div>'
+    f'</div>'
+    f'<div style="text-align:center;flex:1;min-width:140px">'
+    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Наценка</div>'
+    f'<div style="font-size:28px;font-weight:800;color:#27ae60">{_fmt(total_diff)} ₽</div>'
+    f'</div>'
+    f'</div>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
 
 # Рендер карточек по 3 в ряд
 for row_start in range(0, len(sorted_cards), 3):
@@ -638,15 +744,6 @@ for row_start in range(0, len(sorted_cards), 3):
                 unsafe_allow_html=True,
             )
 
-total_frozen = sum(d['frozen'] for _, d in sorted_cards)
-total_frozen_cost = sum(d['frozen_cost'] for _, d in sorted_cards)
-total_diff = total_frozen - total_frozen_cost
-st.markdown(
-    f'**Итого заморожено в товаре:**\n\n'
-    f'- Розничная цена: **{_fmt(total_frozen)} ₽**\n'
-    f'- Себестоимость (25 ₽/шт): **{_fmt(total_frozen_cost)} ₽**\n'
-    f'- Разница (наценка): **{_fmt(total_diff)} ₽**'
-)
 
 st.divider()
 
