@@ -1,11 +1,13 @@
 __pycache__/
 *.pyc
 .DS_Store
-*.numbers
-*.xlsx
-*.csv
 *.bak
 ~$*
 .venv/
 .venv-container/
 .playwright-mcp/
+
+# Бэкапы analytics (любое подчёркивание во внутренней части имени файла = backup)
+analytics_report_*_*.xlsx
+# Старый xlsx-дамп с датой в имени — не используется loader'ом
+analytics_report_2*-*-*.xlsx
