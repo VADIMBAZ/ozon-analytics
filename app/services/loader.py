@@ -10,20 +10,28 @@ SALES_FILES = [
     'sales results 01.09.2025-30.11.2025.numbers',
     'sales results 01.12.2025-28.02.2026.numbers',
     'sales results 01.03.2026-31.03.2026.numbers',
+    'sales results 01.04.2026-30.04.2026.csv',
 ]
 
 SKIP_ARTICLES = {'77SK2024T'}
+
+
+def _read_sales_file(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.csv':
+        return pd.read_csv(path, sep=';')
+    doc = numbers_parser.Document(path)
+    rows = list(doc.sheets[0].tables[0].rows())
+    headers = [str(c.value) for c in rows[0]]
+    data = [[c.value for c in row] for row in rows[1:]]
+    return pd.DataFrame(data, columns=headers)
 
 
 def load_sales() -> pd.DataFrame:
     dfs = []
     for fname in SALES_FILES:
         path = os.path.join(DATA_DIR, fname)
-        doc = numbers_parser.Document(path)
-        rows = list(doc.sheets[0].tables[0].rows())
-        headers = [str(c.value) for c in rows[0]]
-        data = [[c.value for c in row] for row in rows[1:]]
-        dfs.append(pd.DataFrame(data, columns=headers))
+        dfs.append(_read_sales_file(path))
 
     df = pd.concat(dfs, ignore_index=True)
     df['date'] = pd.to_datetime(df['Принят в обработку']).dt.normalize()
@@ -35,7 +43,14 @@ def load_sales() -> pd.DataFrame:
 
 def load_analytics() -> pd.DataFrame:
     pattern = os.path.join(DATA_DIR, 'analytics_report_*.xlsx')
-    files = [f for f in glob.glob(pattern) if not re.search(r'\d{4}-\d{2}-\d{2}', os.path.basename(f))]
+    # Канонический формат: analytics_report_<Месяц> <Год>.xlsx
+    # Любое подчёркивание во «внутренней» части имени = бэкап/служебный файл (например, '_полный', '2026-03-26_12_44').
+    files = []
+    for f in glob.glob(pattern):
+        inner = os.path.basename(f)[len('analytics_report_'):-len('.xlsx')]
+        if '_' in inner:
+            continue
+        files.append(f)
 
     all_data = []
     for fpath in files:
@@ -79,4 +94,15 @@ def load_analytics() -> pd.DataFrame:
             })
 
     df = pd.DataFrame(all_data).sort_values('period_start').reset_index(drop=True)
+
+    # Регрессионная защита: один (артикул, период) должен встречаться ровно один раз.
+    # Иначе значит, что glob подхватил бэкап/дубликат (исторический баг с '_полный.xlsx').
+    dup_mask = df.duplicated(subset=['Артикул', 'period_start'], keep=False)
+    if dup_mask.any():
+        dup_rows = df[dup_mask].sort_values(['period_start', 'Артикул'])
+        raise ValueError(
+            'Дубли в analytics: один (артикул, период) встречается несколько раз. '
+            'Скорее всего, в каталоге лежит бэкап (например, analytics_report_*_полный.xlsx). '
+            f'Проблемные строки:\n{dup_rows[["period_start","Артикул"]].to_string(index=False)}'
+        )
     return df

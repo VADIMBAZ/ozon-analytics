@@ -482,21 +482,25 @@ for art in selected_sorted:
 
     avg_monthly_sales = sum(normal_months_dlv) / len(normal_months_dlv) if normal_months_dlv else 0
 
-    # Шаг 2: считаем потери
+    # Шаг 2: считаем потери.
+    # ВАЖНО: NaN в остаток_конец означает «товара физически нет на складе» (в xlsx стоит «–»),
+    # а не «нет данных». Поэтому NaN-остаток обязан давать стокаут, иначе из расчётов
+    # выпадают полные стокауты вроде 06SK2024 в Apr 2026 (история была — 0 продаж не из-за спроса).
     art_lost = {}
     for month in month_order:
         stock_end = stock_row.get(month, None)
         dlv_val = dlv_row.get(month, 0)
         if pd.isna(dlv_val):
             dlv_val = 0
-        if pd.isna(stock_end) or avg_monthly_sales <= 0:
+        if avg_monthly_sales <= 0:
+            # Нет истории нормальных продаж (новый/неактивный товар) — потерь нет
             art_lost[month] = 0
             continue
-        # Если остаток на конец >= средних продаж — товар не заканчивался
-        if stock_end >= avg_monthly_sales:
+        # Остаток >= средних продаж → товар не заканчивался;
+        # иначе (включая NaN — товара нет совсем) — стокаут.
+        if pd.notna(stock_end) and stock_end >= avg_monthly_sales:
             art_lost[month] = 0
         else:
-            # Товар заканчивался: упущено = недопроданное × средний чек
             missed_sales = max(avg_monthly_sales - dlv_val, 0)
             art_lost[month] = missed_sales * avg_check
 
