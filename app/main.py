@@ -351,13 +351,8 @@ grouped = (
     .reset_index()
 )
 
-# Месячные данные для тепловой карты
 analytics_sel = analytics[analytics['Артикул'].isin(selected)]
 month_order = analytics_sel.drop_duplicates('month_label').sort_values('period_start')['month_label'].tolist()
-pivot_heat = analytics_sel.pivot_table(
-    index='Артикул', columns='month_label',
-    values='дней_без_остатка', aggfunc='first'
-).reindex(columns=month_order).reindex([a for a in all_articles if a in selected])
 
 
 COLORS = [
@@ -365,6 +360,9 @@ COLORS = [
     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
     '#aec7e8', '#ffbb78',
 ]
+# Цвет привязан к артикулу глобально (по позиции в all_articles), а не к индексу в текущей
+# выборке. Иначе один и тот же 06SK2024 в разных графиках получает разные цвета.
+ARTICLE_COLOR = {art: COLORS[i % len(COLORS)] for i, art in enumerate(all_articles)}
 
 # График продаж (без subplot — отдельный)
 fig = go.Figure()
@@ -394,7 +392,7 @@ for i, art in enumerate(selected_sorted):
             y=art_data['Количество'],
             name=art,
             mode='lines+markers',
-            line=dict(width=1.5, color=COLORS[i % len(COLORS)]),
+            line=dict(width=1.5, color=ARTICLE_COLOR[art]),
             marker=dict(size=4),
             opacity=0.7,
         ),
@@ -441,13 +439,13 @@ for art in selected:
 pivot_stock_end = analytics_sel.pivot_table(
     index='Артикул', columns='month_label',
     values='остаток_конец', aggfunc='first'
-).reindex(columns=month_order).reindex([a for a in all_articles if a in selected])
+).reindex(columns=month_order).reindex(selected_sorted)
 
 # Pivot: доставки по месяцам
 pivot_dlv = analytics_sel.pivot_table(
     index='Артикул', columns='month_label',
     values='Доставлено', aggfunc='first'
-).reindex(columns=month_order).reindex([a for a in all_articles if a in selected])
+).reindex(columns=month_order).reindex(selected_sorted)
 
 # Рассчитываем упущенную выручку
 # Логика: если остаток_конец < средних_продаж → товар закончился раньше конца месяца
@@ -518,7 +516,7 @@ for i, art in enumerate(selected_sorted):
         name=art,
         x=month_order,
         y=values,
-        marker_color=COLORS[i % len(COLORS)],
+        marker_color=ARTICLE_COLOR[art],
         text=[f'{v:,.0f}' if v > 0 else '' for v in values],
         textposition='auto',
         textfont_size=10,
@@ -572,18 +570,18 @@ st.subheader('Остаток на конец месяца и приходы')
 pivot_stock = analytics_sel.pivot_table(
     index='Артикул', columns='month_label',
     values='остаток_конец', aggfunc='first'
-).reindex(columns=month_order).reindex(all_articles)
+).reindex(columns=month_order).reindex(selected_sorted)
 
 pivot_dlv_stock = analytics_sel.pivot_table(
     index='Артикул', columns='month_label',
     values='Доставлено', aggfunc='first'
-).reindex(columns=month_order).reindex(all_articles)
+).reindex(columns=month_order).reindex(selected_sorted)
 
 # Рассчитываем приходы: приход = остаток_конец - остаток_предыдущего_месяца + доставлено
 # Порог: < 20 шт считаем шумом (возвраты, корректировки), а не реальной поставкой
 INCOMING_THRESHOLD = 20
 pivot_incoming = pd.DataFrame(index=pivot_stock.index, columns=month_order, dtype=float)
-for art in all_articles:
+for art in selected_sorted:
     if art not in pivot_stock.index:
         continue
     for j, month in enumerate(month_order):
@@ -614,14 +612,14 @@ fig2 = make_subplots(
     subplot_titles=['Остаток на конец месяца', 'Приходы за месяц'],
 )
 
-for i, art in enumerate(all_articles):
+for art in selected_sorted:
     if art not in pivot_stock.index:
         continue
     fig2.add_trace(go.Bar(
         name=art,
         x=month_order,
         y=pivot_stock.loc[art].values,
-        marker_color=COLORS[i % len(COLORS)],
+        marker_color=ARTICLE_COLOR[art],
         legendgroup=art,
     ), row=1, col=1)
 
@@ -630,7 +628,7 @@ for i, art in enumerate(all_articles):
         name=art,
         x=month_order,
         y=incoming_vals,
-        marker_color=COLORS[i % len(COLORS)],
+        marker_color=ARTICLE_COLOR[art],
         marker_line_width=1,
         marker_line_color='white',
         marker_opacity=0.7,
@@ -664,8 +662,15 @@ for _, row in last_month_an.iterrows():
         continue
     stock = row['остаток_конец']
     avg = avg_monthly_dlv.get(art, 0)
-    if pd.isna(stock) or avg <= 0:
+    if avg <= 0:
+        # У артикула нет истории продаж — карточку строить не из чего.
         continue
+    # NaN в остаток_конец означает «товара физически нет на складе» (в xlsx стоит «–»),
+    # а не «нет данных» — тот же инвариант, что в расчёте упущенной выручки.
+    # Если пропустить такие строки — лидер продаж с пустым складом (06SK2024 в Apr 2026)
+    # исчезает из «Анализа запасов», хотя это и есть самый срочный стокаут.
+    if pd.isna(stock):
+        stock = 0
     months_cover = stock / avg
     avg_price = delivered_sel[delivered_sel['Артикул'] == art]
     if len(avg_price) > 0:
@@ -685,16 +690,23 @@ for _, row in last_month_an.iterrows():
         'price': price_per,
     }
 
-# Сортировка: сначала перезатарка (>6 мес), потом избыток (3-6), потом норма (<3)
-# Внутри группы — по замороженным деньгам
+# Сортировка по срочности действий: стокаут → заканчивается → перезатарка → избыток → норма.
+# Внутри группы — по абсолютной величине проблемы:
+# - для стокаутов/заканчивающихся сортируем по упущенной выручке (худший наверху);
+# - для перезатарки/избытка — по объёму замороженных денег;
+# - для нормы — по выручке (просто чтобы был стабильный порядок).
 def _card_sort_key(item):
     m = item[1]['months']
-    if m > 6:
-        priority = 0  # перезатарка — наверх
+    if m < 0.5:
+        priority = 0  # стокаут — действовать срочно, нужна поставка
+    elif m < 1:
+        priority = 1  # заканчивается — пора заказывать
+    elif m > 6:
+        priority = 2  # перезатарка — много заморожено
     elif m > 3:
-        priority = 1  # избыток
+        priority = 3  # избыток
     else:
-        priority = 2  # норма
+        priority = 4  # норма
     return (priority, -item[1]['frozen'])
 
 sorted_cards = sorted(stock_cards.items(), key=_card_sort_key)
@@ -737,7 +749,17 @@ for row_start in range(0, len(sorted_cards), 3):
     for idx, (art, data) in enumerate(row_cards):
         with cols[idx]:
             months = data['months']
-            if months <= 3:
+            # Нижние пороги критичнее перезатарки: пустой склад блокирует продажи,
+            # а перезатарка — только замораживает деньги. Поэтому порядок: стокаут → норма → перезатарка.
+            if months < 0.5:
+                bar_color = '#c0392b'
+                status = 'Стокаут'
+                status_color = '#c0392b'
+            elif months < 1:
+                bar_color = '#e67e22'
+                status = 'Заканчивается'
+                status_color = '#e67e22'
+            elif months <= 3:
                 bar_color = '#2ecc71'
                 status = 'Норма'
                 status_color = '#2ecc71'

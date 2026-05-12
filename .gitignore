@@ -11,3 +11,9 @@ __pycache__/
 analytics_report_*_*.xlsx
 # Старый xlsx-дамп с датой в имени — не используется loader'ом
 analytics_report_2*-*-*.xlsx
+
+# Рабочие скриншоты для аудита дашборда (создаются playwright-проверками)
+audit-*.png
+verify-*.png
+dashboard-*.png
+dashboard-*.jpeg
