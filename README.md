@@ -1,5 +1,9 @@
 # Ozon Аналитика — Спутник Ключи
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://ozon-sputnik.streamlit.app/)
+
+**Публичная ссылка:** https://ozon-sputnik.streamlit.app/ — обновляется автоматически при `git push origin main` (Streamlit Community Cloud деплоит из публичного зеркала [`VADIMBAZ/ozon-analytics`](https://github.com/VADIMBAZ/ozon-analytics)).
+
 Streamlit-дашборд для анализа продаж и запасов товаров на Ozon (артикулы `*SK2024` — ключи от умного домофона Спутник).
 
 Объединяет два источника данных Ozon:
