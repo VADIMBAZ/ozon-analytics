@@ -2,8 +2,8 @@
 headless = true
 enableCORS = false
 enableXsrfProtection = false
-address = "127.0.0.1"
-port = 8501
+# address/port не задаём — Streamlit Cloud управляет ими через переменные окружения.
+# Локально run.sh передаёт --server.port явно, дефолт 8501.
 
 [browser]
 gatherUsageStats = false
