@@ -17,3 +17,7 @@ audit-*.png
 verify-*.png
 dashboard-*.png
 dashboard-*.jpeg
+cloud-*.png
+
+# Локальный файл секретов Streamlit (если когда-нибудь появится)
+.streamlit/secrets.toml

@@ -103,6 +103,92 @@ st.sidebar.caption(f'Выбрано: {count} из {total}')
 st.sidebar.divider()
 granularity = st.sidebar.radio('Гранулярность', ['Неделя', 'Месяц'], horizontal=True)
 
+# ── Загрузка отчётов через UI ───────────────────────────────────────────────
+
+
+def _render_upload_block() -> None:
+    """Блок «Обновить данные»: пользователь загружает analytics_report и/или
+    sales results, они валидируются и коммитятся в публичный mirror репо.
+    Streamlit Cloud сам пересоберёт дашборд через ~90 сек.
+
+    Без `GITHUB_TOKEN` и `UPLOAD_PASSWORD` в st.secrets блок показывает
+    подсказку, но не падает (например, при локальном запуске).
+    """
+    try:
+        token = st.secrets.get('GITHUB_TOKEN', '')
+        upload_pwd = st.secrets.get('UPLOAD_PASSWORD', '')
+    except Exception:
+        # На локальном запуске без secrets.toml st.secrets может бросать.
+        token = upload_pwd = ''
+
+    with st.sidebar.expander('🔄 Обновить данные'):
+        if not token or not upload_pwd:
+            st.caption(
+                'Функция отключена. Чтобы включить, нужно добавить в Streamlit Cloud → '
+                'Settings → Secrets два ключа:\n\n'
+                '- `GITHUB_TOKEN` — fine-grained PAT с правами **Contents: Read and write** '
+                'на репозиторий `VADIMBAZ/ozon-analytics`\n'
+                '- `UPLOAD_PASSWORD` — любая строка-пароль, защищает форму от случайных посетителей'
+            )
+            return
+
+        pwd = st.text_input('Пароль', type='password', key='upload_pwd')
+        files = st.file_uploader(
+            'Перетащи сюда analytics_report*.xlsx и/или sales results*.{numbers,csv,xlsx}',
+            accept_multiple_files=True,
+            type=['xlsx', 'numbers', 'csv'],
+            key='upload_files',
+        )
+
+        if not st.button('Применить', key='upload_submit'):
+            return
+
+        if pwd != upload_pwd:
+            st.error('Неверный пароль.')
+            return
+        if not files:
+            st.warning('Не выбрано ни одного файла.')
+            return
+
+        from services.uploader import validate_upload, commit_to_github, ValidationError
+
+        # Сначала валидируем ВСЕ файлы — если хоть один невалиден, не коммитим ничего.
+        validated_list = []
+        for f in files:
+            raw = f.getvalue()
+            try:
+                v = validate_upload(f.name, raw)
+            except ValidationError as e:
+                st.error(f'❌ **{f.name}**: {e}\n\nЗагрузи правильный файл.')
+                return
+            validated_list.append(v)
+
+        # Все файлы прошли проверку — коммитим по очереди.
+        with st.spinner('Коммит в GitHub…'):
+            for v in validated_list:
+                try:
+                    res = commit_to_github(
+                        v, repo_full_name='VADIMBAZ/ozon-analytics', token=token,
+                    )
+                except Exception as e:
+                    st.error(
+                        f'❌ Не удалось закоммитить **{v.canonical_name}**: {e}\n\n'
+                        'Проверь, что GITHUB_TOKEN валидный и имеет права Contents: write.'
+                    )
+                    return
+                st.success(
+                    f'✅ **{v.canonical_name}** ({"обновлён" if res["action"] == "updated" else "добавлен"}) '
+                    f'· [{res["sha"][:7]}]({res["url"]})'
+                )
+
+        st.info(
+            'Streamlit Cloud пересоберёт дашборд через ~90 секунд. '
+            'Обнови страницу через минуту-две, чтобы увидеть новые данные.'
+        )
+
+
+_render_upload_block()
+
 if not selected:
     st.warning('Выберите хотя бы один артикул.')
     st.stop()

@@ -6,12 +6,10 @@ import numbers_parser
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', '..')
 
-SALES_FILES = [
-    'sales results 01.09.2025-30.11.2025.numbers',
-    'sales results 01.12.2025-28.02.2026.numbers',
-    'sales results 01.03.2026-31.03.2026.numbers',
-    'sales results 01.04.2026-30.04.2026.csv',
-]
+# Файлы заказов подхватываются автоматически по маске. Канонический формат:
+#   sales results <DD.MM.YYYY>-<DD.MM.YYYY>.<numbers|csv|xlsx>
+# Имена с подчёркиванием/суффиксом во внутренней части = бэкап (см. фильтр ниже).
+SALES_GLOB_EXTS = ('numbers', 'csv', 'xlsx')
 
 SKIP_ARTICLES = {'77SK2024T'}
 
@@ -20,6 +18,8 @@ def _read_sales_file(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext == '.csv':
         return pd.read_csv(path, sep=';')
+    if ext == '.xlsx':
+        return pd.read_excel(path)
     doc = numbers_parser.Document(path)
     rows = list(doc.sheets[0].tables[0].rows())
     headers = [str(c.value) for c in rows[0]]
@@ -27,10 +27,27 @@ def _read_sales_file(path: str) -> pd.DataFrame:
     return pd.DataFrame(data, columns=headers)
 
 
+def _discover_sales_files() -> list[str]:
+    """Находит все файлы заказов по маске, фильтруя бэкапы."""
+    files = []
+    for ext in SALES_GLOB_EXTS:
+        files.extend(glob.glob(os.path.join(DATA_DIR, f'sales results *.{ext}')))
+    # Фильтр бэкапов: .bak уже отсеивается через glob (нет в SALES_GLOB_EXTS).
+    # Дополнительно отсекаем имена с " (1)", " копия" и т.п. — типичные дубли.
+    files = [f for f in files
+             if not any(suf in os.path.basename(f) for suf in (' (1)', ' (2)', ' копия', '_copy'))]
+    return sorted(files)
+
+
 def load_sales() -> pd.DataFrame:
     dfs = []
-    for fname in SALES_FILES:
-        path = os.path.join(DATA_DIR, fname)
+    files = _discover_sales_files()
+    if not files:
+        raise FileNotFoundError(
+            f'Не найдено ни одного файла заказов в {DATA_DIR}. '
+            'Ожидается «sales results <даты>.<numbers|csv|xlsx>».'
+        )
+    for path in files:
         dfs.append(_read_sales_file(path))
 
     df = pd.concat(dfs, ignore_index=True)
