@@ -22,7 +22,14 @@ from typing import Literal
 
 import pandas as pd
 
-FileKind = Literal['analytics', 'sales']
+FileKind = Literal['analytics', 'sales', 'unit']
+
+# Папки, куда коммитятся файлы каждого типа. Корень — для analytics/sales (исторически).
+KIND_DIRECTORY = {
+    'analytics': '',
+    'sales': '',
+    'unit': 'data/unit_economics/',
+}
 
 # Канонические русские названия месяцев (как в существующих xlsx).
 RU_MONTHS = [
@@ -123,6 +130,52 @@ def _validate_sales_file(name: str, raw: bytes) -> ValidatedFile:
     )
 
 
+def _validate_unit_xlsx(name: str, raw: bytes) -> ValidatedFile:
+    """Проверяем, что xlsx — Юнит-экономика от Озон, и извлекаем период."""
+    try:
+        df = pd.read_excel(io.BytesIO(raw), header=None)
+    except Exception as e:
+        raise ValidationError(f'Не удалось прочитать xlsx: {e}')
+
+    if df.shape[0] < 5 or df.shape[1] < 29:
+        raise ValidationError(
+            'xlsx не похож на «Юнит-экономика»: ожидаются 5+ строк и 29+ колонок, '
+            f'а в файле {df.shape[0]}×{df.shape[1]}.'
+        )
+
+    period_str = str(df.iloc[0, 0])
+    dates = re.findall(r'(\d{2}\.\d{2}\.\d{4})', period_str)
+    if len(dates) < 2:
+        raise ValidationError(
+            f'В заголовке xlsx (ячейка A1) не нашёл двух дат периода. '
+            f'Содержимое: «{period_str[:120]}». Похоже, это не «Юнит-экономика».'
+        )
+
+    period_start = datetime.strptime(dates[0], '%d.%m.%Y')
+    period_end = datetime.strptime(dates[1], '%d.%m.%Y')
+
+    if (period_start.day != 1
+            or period_end.month != period_start.month
+            or period_end.year != period_start.year):
+        raise ValidationError(
+            f'Период в файле — с {dates[0]} по {dates[1]}, это не один календарный месяц. '
+            '«Юнит-экономика» в дашборде хранится помесячно (1-е по последнее число месяца). '
+            'Скачай в Озон отчёт за календарный месяц.'
+        )
+
+    month_label = f'{RU_MONTHS[period_start.month]} {period_start.year}'
+    canonical_name = (
+        f'Юнит-экономика_{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}.xlsx'
+    )
+
+    return ValidatedFile(
+        kind='unit',
+        canonical_name=canonical_name,
+        content=raw,
+        period_label=month_label,
+    )
+
+
 def _parse_sales_bytes(raw: bytes, ext: str) -> pd.DataFrame:
     """Парсит байты файла заказов. Любые ошибки парсинга → ValidationError."""
     try:
@@ -163,19 +216,27 @@ def validate_upload(name: str, raw: bytes) -> ValidatedFile:
         ValidationError: если файл не похож на ожидаемый отчёт.
     """
     lower = name.lower()
+    # Юнит-экономика распознаётся по префиксу имени.
+    if lower.endswith('.xlsx') and ('юнит-эконом' in lower or 'unit' in lower and 'econom' in lower):
+        return _validate_unit_xlsx(name, raw)
     if lower.endswith('.xlsx') and 'analytics' in lower:
         return _validate_analytics_xlsx(name, raw)
     if lower.endswith('.xlsx'):
-        # xlsx без префикса analytics — может быть и sales (теоретически). Пробуем оба.
-        try:
-            return _validate_analytics_xlsx(name, raw)
-        except ValidationError:
-            return _validate_sales_file(name, raw)
+        # xlsx без явного префикса — пробуем все три по очереди.
+        for validator in (_validate_analytics_xlsx, _validate_unit_xlsx, _validate_sales_file):
+            try:
+                return validator(name, raw)
+            except ValidationError:
+                continue
+        raise ValidationError(
+            f'xlsx «{name}» не распознан ни как analytics_report, ни как Юнит-экономика, '
+            'ни как sales. Проверь, что это правильный отчёт.'
+        )
     if lower.endswith(('.numbers', '.csv')):
         return _validate_sales_file(name, raw)
     raise ValidationError(
-        f'Не понял тип файла «{name}». Ожидаются analytics_report_*.xlsx '
-        'или sales results *.{numbers,csv,xlsx}.'
+        f'Не понял тип файла «{name}». Ожидаются analytics_report_*.xlsx, '
+        'Юнит-экономика_*.xlsx или sales results *.{numbers,csv,xlsx}.'
     )
 
 
@@ -203,14 +264,17 @@ def commit_to_github(
 
     gh = Github(token)
     repo = gh.get_repo(repo_full_name)
-    path = file.canonical_name
+    path = KIND_DIRECTORY[file.kind] + file.canonical_name
+
+    kind_label = {
+        'analytics': 'analytics',
+        'sales': 'sales',
+        'unit': 'юнит-экономика',
+    }[file.kind]
 
     try:
         existing = repo.get_contents(path, ref=branch)
-        message = (
-            f'data: обновлён {file.period_label} '
-            f'({"analytics" if file.kind == "analytics" else "sales"}) через дашборд'
-        )
+        message = f'data: обновлён {file.period_label} ({kind_label}) через дашборд'
         result = repo.update_file(
             path=path,
             message=message,
@@ -227,10 +291,7 @@ def commit_to_github(
         if e.status != 404:
             raise
         # Файла нет — создаём.
-        message = (
-            f'data: добавлен {file.period_label} '
-            f'({"analytics" if file.kind == "analytics" else "sales"}) через дашборд'
-        )
+        message = f'data: добавлен {file.period_label} ({kind_label}) через дашборд'
         result = repo.create_file(
             path=path,
             message=message,

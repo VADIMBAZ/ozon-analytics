@@ -1,10 +1,12 @@
 import os
 import re
 import glob
+import calendar
 import pandas as pd
 import numbers_parser
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', '..')
+UNIT_DIR = os.path.join(DATA_DIR, 'data', 'unit_economics')
 
 # Файлы заказов подхватываются автоматически по маске. Канонический формат:
 #   sales results <DD.MM.YYYY>-<DD.MM.YYYY>.<numbers|csv|xlsx>
@@ -123,3 +125,145 @@ def load_analytics() -> pd.DataFrame:
             f'Проблемные строки:\n{dup_rows[["period_start","Артикул"]].to_string(index=False)}'
         )
     return df
+
+
+# ---------- Юнит-экономика ----------
+# Канонический формат: Юнит-экономика_<DD.MM.YYYY>-<DD.MM.YYYY>.xlsx
+# Только календарные месяцы (1.MM.YYYY до последнего числа того же месяца).
+#
+# Заголовки колонок Озон периодически меняет (с декабря 2025 добавилось 4 новых
+# поля «Дополнительная обработка ОВХ», «Звёздные товары», «Платный бренд»,
+# «Отзывы»). Поэтому индексы колонок ищем по тексту заголовка в строке 4,
+# а не хардкодим. Один логический столбец может приходить под разными именами —
+# тогда передаём список альтернатив.
+UNIT_HEADER_ALIASES: dict[str, list[str]] = {
+    'Артикул': ['Артикул'],
+    'Цена': ['Текущая цена', 'Цена'],
+    'Заказано': ['Заказано товаров, шт', 'Заказано'],
+    'Доставлено': ['Доставлено товаров, шт', 'Доставлено'],
+    'Возвращено': ['Возвращено товаров, шт', 'Возвращено'],
+    'Выручка': ['Выручка'],
+    'Баллы за скидки': ['Баллы за скидки'],
+    'Программы партнёров': ['Программы партнёров'],
+    'Вознаграждение Ozon': ['Вознаграждение Ozon'],
+    'Эквайринг': ['Эквайринг'],
+    'Обработка отправления': ['Обработка отправления'],
+    'Логистика': ['Логистика'],
+    'Доставка до ПВЗ': ['Доставка до места выдачи', 'Доставка до ПВЗ'],
+    'Стоимость размещения': ['Стоимость размещения'],
+    'Обработка возврата': ['Обработка возврата'],
+    'Обратная логистика': ['Обратная логистика'],
+    'Утилизация': ['Утилизация'],
+    'Ошибки продавца': ['Обработка ошибок продавца', 'Операционные ошибки'],
+    'Оплата за клик': ['Оплата за клик'],
+    'Оплата за заказ': ['Оплата за заказ'],
+    'Доля от продаж': ['Доля от продаж'],
+    'Прибыль за шт': ['Прибыль за шт'],
+    'Прибыль за период': ['Прибыль за период'],
+}
+
+
+def _build_header_index(header_row) -> dict[str, int]:
+    """Из R4 строит {логическое имя → 0-based индекс колонки}. KeyError на пропавшее поле."""
+    raw = {str(v).strip().replace('\n', ' ') if v is not None else '': i
+           for i, v in enumerate(header_row)}
+    out = {}
+    for logical, aliases in UNIT_HEADER_ALIASES.items():
+        for alias in aliases:
+            if alias in raw:
+                out[logical] = raw[alias]
+                break
+    return out
+
+
+def _parse_unit_filename(path: str):
+    """Извлекает (period_start, period_end, is_monthly) из имени файла или (None, None, False)."""
+    name = os.path.basename(path)
+    m = re.search(r'(\d{2}\.\d{2}\.\d{4})-(\d{2}\.\d{2}\.\d{4})', name)
+    if not m:
+        return None, None, False
+    start = pd.to_datetime(m.group(1), format='%d.%m.%Y')
+    end = pd.to_datetime(m.group(2), format='%d.%m.%Y')
+    last_day = calendar.monthrange(start.year, start.month)[1]
+    is_monthly = (
+        start.day == 1
+        and end.day == last_day
+        and start.year == end.year
+        and start.month == end.month
+    )
+    return start, end, is_monthly
+
+
+def load_unit_economics() -> tuple[pd.DataFrame, list[str]]:
+    """Парсит data/unit_economics/Юнит-экономика_*.xlsx.
+
+    Возвращает (df, warnings). Файлы с произвольным диапазоном (не календарный месяц)
+    пропускаются — их имя попадает в warnings.
+    """
+    warnings: list[str] = []
+    if not os.path.isdir(UNIT_DIR):
+        return pd.DataFrame(), warnings
+
+    files = sorted(glob.glob(os.path.join(UNIT_DIR, 'Юнит-экономика_*.xlsx')))
+    rows = []
+    for fpath in files:
+        start, end, is_monthly = _parse_unit_filename(fpath)
+        if start is None:
+            warnings.append(f'{os.path.basename(fpath)}: не удалось извлечь даты из имени')
+            continue
+        if not is_monthly:
+            warnings.append(
+                f'{os.path.basename(fpath)}: не календарный месяц ({start:%d.%m}–{end:%d.%m}), пропущено'
+            )
+            continue
+
+        df_raw = pd.read_excel(fpath, header=None, sheet_name=0)
+        # R2 может содержать маркер «экстраполировано из …» — для синтезированных
+        # файлов (например, сшитый ноябрь из частичных выгрузок). UI покажет сноску.
+        r2 = str(df_raw.iloc[1, 0]) if pd.notna(df_raw.iloc[1, 0]) else ''
+        is_synth = 'экстраполи' in r2.lower()
+
+        # Шапка занимает 4 строки. Колонки находим по тексту заголовка (R4),
+        # а не по индексу — Озон периодически добавляет новые поля.
+        header_idx = _build_header_index(df_raw.iloc[3])
+        if 'Артикул' not in header_idx or 'Прибыль за период' not in header_idx:
+            warnings.append(
+                f'{os.path.basename(fpath)}: не нашёл обязательных колонок '
+                f'(Артикул / Прибыль за период) в R4, пропущено'
+            )
+            continue
+
+        art_col = header_idx['Артикул']
+        for i in range(4, len(df_raw)):
+            row = df_raw.iloc[i]
+            art = str(row.iloc[art_col]) if pd.notna(row.iloc[art_col]) else 'nan'
+            if art == 'nan' or art in SKIP_ARTICLES:
+                continue
+            rec = {
+                'period_start': start,
+                'period_end': end,
+                'month_label': start.strftime('%b %Y'),
+                'Артикул': art,
+                'is_synthesized': is_synth,
+                'source_note': r2 if is_synth else '',
+            }
+            for logical, col_idx in header_idx.items():
+                if logical == 'Артикул':
+                    continue
+                rec[logical] = pd.to_numeric(row.iloc[col_idx], errors='coerce')
+            rows.append(rec)
+
+    if not rows:
+        return pd.DataFrame(), warnings
+
+    df = pd.DataFrame(rows).sort_values(['period_start', 'Артикул']).reset_index(drop=True)
+
+    # Регрессионная защита: один (артикул, период) — одна строка
+    dup_mask = df.duplicated(subset=['Артикул', 'period_start'], keep=False)
+    if dup_mask.any():
+        dup_rows = df[dup_mask][['period_start', 'Артикул']]
+        raise ValueError(
+            'Дубли в unit_economics: один (артикул, период) встречается несколько раз. '
+            f'Проверь содержимое {UNIT_DIR}.\n{dup_rows.to_string(index=False)}'
+        )
+    return df, warnings

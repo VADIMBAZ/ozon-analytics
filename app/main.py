@@ -7,9 +7,9 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from services.loader import load_sales, load_analytics
+from services.loader import load_sales, load_analytics, load_unit_economics
 
-COST_PER_UNIT = 25  # себестоимость, ₽/шт
+DEFAULT_COST_PER_UNIT = 25  # дефолт себестоимости, ₽/шт (заменяется виджетом в сайдбаре)
 
 st.set_page_config(page_title='Ozon Аналитика', layout='wide', page_icon='📦')
 
@@ -33,9 +33,10 @@ st.markdown("""
 
 @st.cache_data
 def get_data():
-    return load_sales(), load_analytics()
+    unit_df, unit_warnings = load_unit_economics()
+    return load_sales(), load_analytics(), unit_df, unit_warnings
 
-sales, analytics = get_data()
+sales, analytics, unit_economics, unit_warnings = get_data()
 
 # ── Сайдбар ─────────────────────────────────────────────────────────────────
 
@@ -151,6 +152,19 @@ st.sidebar.caption(
 )
 st.sidebar.divider()
 
+# ── Сайдбар: себестоимость ────────────────────────────────────────────────
+# Одна цифра на все артикулы. Влияет на: «Заморожено по себестоимости»
+# (раздел запасов) и чистую прибыль/маржу (юнит-экономика).
+st.sidebar.markdown('### 💰 Себестоимость')
+cost_per_unit = st.sidebar.number_input(
+    'Себестоимость ключа, ₽/шт',
+    min_value=0, max_value=10000,
+    value=st.session_state.get('cost_per_unit', DEFAULT_COST_PER_UNIT),
+    step=1, key='cost_per_unit', label_visibility='collapsed',
+)
+st.sidebar.caption(f'_₽/шт. Применяется ко всем артикулам._')
+st.sidebar.divider()
+
 # ── Сайдбар: артикулы ──────────────────────────────────────────────────────
 
 # Инициализация состояния
@@ -236,7 +250,7 @@ def _render_upload_block() -> None:
 
         pwd = st.text_input('Пароль', type='password', key='upload_pwd')
         files = st.file_uploader(
-            'Перетащи сюда analytics_report*.xlsx и/или sales results*.{numbers,csv,xlsx}',
+            'analytics_report*.xlsx · sales results*.{numbers,csv,xlsx} · Юнит-экономика_*.xlsx',
             accept_multiple_files=True,
             type=['xlsx', 'numbers', 'csv'],
             key='upload_files',
@@ -910,7 +924,7 @@ for _, row in last_month_an.iterrows():
     else:
         price_per = 0
     frozen = stock * price_per
-    frozen_cost = stock * COST_PER_UNIT
+    frozen_cost = stock * cost_per_unit
     stock_cards[art] = {
         'stock': int(stock),
         'avg': avg,
@@ -960,7 +974,7 @@ st.markdown(
     f'<div style="font-size:28px;font-weight:800;color:#e74c3c">{_fmt(total_frozen)} ₽</div>'
     f'</div>'
     f'<div style="text-align:center;flex:1;min-width:140px">'
-    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Себестоимость ({COST_PER_UNIT} ₽/шт)</div>'
+    f'<div style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px">Себестоимость ({cost_per_unit} ₽/шт)</div>'
     f'<div style="font-size:28px;font-weight:800;color:#2980b9">{_fmt(total_frozen_cost)} ₽</div>'
     f'</div>'
     f'<div style="text-align:center;flex:1;min-width:140px">'
@@ -1103,3 +1117,432 @@ with st.expander('Сводная таблица по месяцам'):
         .map(_highlight_stock, subset=['Остаток'])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
+# ── Юнит-экономика ──────────────────────────────────────────────────────────
+# Финансовая раскладка по данным Озон (файлы Юнит-экономика_*.xlsx).
+# Себестоимость берётся из сайдбара (cost_per_unit), Озон её не знает.
+st.divider()
+st.subheader('💰 Юнит-экономика')
+st.caption(
+    f'Финансовая раскладка по данным Озон. '
+    f'Себестоимость — {cost_per_unit} ₽/шт (меняется в сайдбаре).'
+)
+
+for w in unit_warnings:
+    st.warning(w)
+
+if unit_economics.empty:
+    st.info(
+        'Нет файлов юнит-экономики в `data/unit_economics/`. '
+        'Загрузите их через блок «Обновить данные» в сайдбаре '
+        '(имя должно быть `Юнит-экономика_DD.MM.YYYY-DD.MM.YYYY.xlsx`).'
+    )
+else:
+    # Месяц попадает в фильтр, если он пересекается с выбранным окном
+    # (диапазон фильтра может стартовать со «среднего» дня месяца — например,
+    # 04.09 у первого месяца истории — но сам unit-файл при этом за весь сентябрь).
+    unit_sel = unit_economics[
+        (unit_economics['period_start'] <= period_end)
+        & (unit_economics['period_end'] >= period_start)
+        & (unit_economics['Артикул'].isin(selected_sorted))
+    ].copy()
+
+    if unit_sel.empty:
+        st.warning(
+            'За выбранный период и набор артикулов нет unit-данных. '
+            'Доступные месяцы: '
+            + ', '.join(sorted(unit_economics['month_label'].unique()))
+        )
+    else:
+        # Чистая прибыль (после COGS) и маржа считаются по нашей формуле.
+        # «Прибыль за период» из файла — это маржинальный вклад до COGS (Озон
+        # не знает себестоимости), её берём как есть.
+        unit_sel['Чистая_продано_шт'] = unit_sel['Доставлено'] - unit_sel['Возвращено']
+        unit_sel['COGS_итого'] = unit_sel['Чистая_продано_шт'] * cost_per_unit
+        unit_sel['Прибыль чистая'] = unit_sel['Прибыль за период'] - unit_sel['COGS_итого']
+
+        u_revenue = unit_sel['Выручка'].sum()
+        u_profit_gross = unit_sel['Прибыль за период'].sum()
+        u_cogs = unit_sel['COGS_итого'].sum()
+        u_profit_net = u_profit_gross - u_cogs
+        u_margin_net = (u_profit_net / u_revenue * 100) if u_revenue > 0 else 0
+
+        # Дельты vs предыдущее окно такой же длины
+        _u_window_days = (period_end - period_start).days
+        _u_prev_end = period_start - pd.Timedelta(days=1)
+        _u_prev_start = _u_prev_end - pd.Timedelta(days=_u_window_days)
+        # Для предыдущего окна берём только месяцы, полностью попавшие в него,
+        # чтобы текущий месяц не учитывался дважды (текущее окно использует
+        # пересечение, и Sep 2025 может зацепить prev_end = 03.09 по дате начала).
+        _u_prev = unit_economics[
+            (unit_economics['period_start'] >= _u_prev_start)
+            & (unit_economics['period_end'] <= _u_prev_end)
+            & (unit_economics['Артикул'].isin(selected_sorted))
+        ]
+        if not _u_prev.empty:
+            _u_p_rev = _u_prev['Выручка'].sum()
+            _u_p_gross = _u_prev['Прибыль за период'].sum()
+            _u_p_cogs = ((_u_prev['Доставлено'] - _u_prev['Возвращено']) * cost_per_unit).sum()
+            _u_p_net = _u_p_gross - _u_p_cogs
+            _u_p_margin = (_u_p_net / _u_p_rev * 100) if _u_p_rev > 0 else 0
+            _du_rev_s = f'{u_revenue - _u_p_rev:+,.0f} ₽'.replace(',', ' ')
+            _du_gross_s = f'{u_profit_gross - _u_p_gross:+,.0f} ₽'.replace(',', ' ')
+            _du_net_s = f'{u_profit_net - _u_p_net:+,.0f} ₽'.replace(',', ' ')
+            _du_marg_s = f'{u_margin_net - _u_p_margin:+.1f} пп'
+        else:
+            _du_rev_s = _du_gross_s = _du_net_s = _du_marg_s = None
+
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        kc1.metric('Выручка', f'{u_revenue:,.0f} ₽'.replace(',', ' '), delta=_du_rev_s)
+        kc2.metric('Прибыль до COGS', f'{u_profit_gross:,.0f} ₽'.replace(',', ' '),
+                   delta=_du_gross_s,
+                   help='Маржинальный вклад по версии Озон — выручка минус все расходы маркетплейса, без учёта себестоимости.')
+        kc3.metric('Прибыль чистая', f'{u_profit_net:,.0f} ₽'.replace(',', ' '),
+                   delta=_du_net_s,
+                   help=f'Прибыль до COGS минус себестоимость ({cost_per_unit} ₽/шт × проданных).')
+        kc4.metric('Маржа чистая %', f'{u_margin_net:.1f}%', delta=_du_marg_s)
+
+        # ── Структура расходов и компенсаций (% выручки) ──
+        # Расходы (положительные значения = сколько съели от выручки) и компенсации
+        # (зелёная карточка, баллы за скидки + программы партнёров — то, что Озон
+        # возвращает продавцу). Баланс: 100% = Расходы + COGS − Компенсации + Прибыль.
+        u_compensations = (unit_sel['Баллы за скидки'].sum()
+                            + unit_sel['Программы партнёров'].sum())
+        _cost_categories = [
+            ('Комиссия Озон', -unit_sel['Вознаграждение Ozon'].sum() - unit_sel['Эквайринг'].sum(), 'expense'),
+            ('Логистика', -unit_sel[['Логистика', 'Доставка до ПВЗ',
+                                     'Обработка отправления', 'Стоимость размещения']].sum().sum(), 'expense'),
+            ('Возвраты', -unit_sel[['Обработка возврата', 'Обратная логистика']].sum().sum(), 'expense'),
+            ('Реклама', -unit_sel[['Оплата за клик', 'Оплата за заказ']].sum().sum(), 'expense'),
+            ('Себестоимость', u_cogs, 'expense'),
+            ('Компенсации', u_compensations, 'income'),
+        ]
+        cost_cols = st.columns(len(_cost_categories))
+        for (cat, val, kind), col in zip(_cost_categories, cost_cols):
+            pct = (val / u_revenue * 100) if u_revenue > 0 else 0
+            if kind == 'income':
+                color = '#27ae60'  # зелёный, доход
+                sign = '+'
+            else:
+                color = '#c0392b' if pct > 15 else ('#e67e22' if pct > 5 else '#7f8c8d')
+                sign = ''
+            val_str = f'{val:,.0f}'.replace(',', ' ')
+            col.markdown(
+                f'<div style="text-align:center;padding:8px;border:1px solid #eee;border-radius:8px;background:#fafafa">'
+                f'<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px">{cat}</div>'
+                f'<div style="font-size:20px;font-weight:700;color:{color};margin-top:4px">{sign}{pct:.1f}%</div>'
+                f'<div style="font-size:11px;color:#aaa">{sign}{val_str} ₽</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Обязательная сноска про синтезированные/экстраполированные месяцы.
+        # Без неё пользователь рискует прочитать график буквально, а это не
+        # реальные данные Озон.
+        _synth = unit_sel[unit_sel['is_synthesized']]
+        if not _synth.empty:
+            _notes = sorted(set(zip(_synth['month_label'], _synth['source_note'])))
+            for ml, note in _notes:
+                st.caption(f'⚠️ **{ml}** — {note}. Маржа и расходы могут быть смещены на ±5–10 пп.')
+
+        st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+
+        # ── Табы ──
+        tab_dyn, tab_struct, tab_lost = st.tabs([
+            '📈 Динамика маржи', '💸 Структура расходов', '🎯 Упущенная прибыль'
+        ])
+
+        # ── Таб 1: Динамика маржи ──
+        with tab_dyn:
+            # Считаем помесячно: маржа % и прибыль ₽ per (Артикул, period_start)
+            unit_month = (
+                unit_sel.groupby(['period_start', 'month_label', 'Артикул'])
+                .agg({
+                    'Выручка': 'sum',
+                    'Прибыль за период': 'sum',
+                    'Чистая_продано_шт': 'sum',
+                })
+                .reset_index()
+            )
+            unit_month['COGS_итого'] = unit_month['Чистая_продано_шт'] * cost_per_unit
+            unit_month['Прибыль чистая'] = unit_month['Прибыль за период'] - unit_month['COGS_итого']
+            unit_month['Маржа %'] = (unit_month['Прибыль чистая'] / unit_month['Выручка'].replace(0, pd.NA)) * 100
+            unit_month = unit_month.sort_values('period_start')
+
+            months_ordered = sorted(unit_month['month_label'].unique(),
+                                    key=lambda m: unit_month[unit_month['month_label'] == m]['period_start'].min())
+
+            if len(months_ordered) == 1:
+                st.info(
+                    f'Доступен только один месяц unit-данных ({months_ordered[0]}). '
+                    'Для динамики загрузи файлы за остальные месяцы. '
+                    'Ниже — сравнение SKU за этот месяц.'
+                )
+
+            # График 1: маржа % линиями (агрегат + по SKU)
+            fig_margin = make_subplots(specs=[[{'secondary_y': True}]])
+            agg_by_month = unit_month.groupby(['period_start', 'month_label']).agg({
+                'Выручка': 'sum', 'Прибыль чистая': 'sum'
+            }).reset_index().sort_values('period_start')
+            agg_by_month['Маржа %'] = (agg_by_month['Прибыль чистая']
+                                       / agg_by_month['Выручка'].replace(0, pd.NA)) * 100
+
+            fig_margin.add_trace(
+                go.Scatter(
+                    x=agg_by_month['month_label'], y=agg_by_month['Маржа %'],
+                    mode='lines+markers', name='Маржа (агрегат) %',
+                    line=dict(color='#2c3e50', width=3),
+                    marker=dict(size=10),
+                ),
+                secondary_y=False,
+            )
+            for art in selected_sorted:
+                art_data = unit_month[unit_month['Артикул'] == art].sort_values('period_start')
+                if art_data.empty:
+                    continue
+                fig_margin.add_trace(
+                    go.Scatter(
+                        x=art_data['month_label'], y=art_data['Маржа %'],
+                        mode='lines+markers', name=art,
+                        line=dict(color=ARTICLE_COLOR.get(art, '#999'), width=1.5, dash='dot'),
+                        marker=dict(size=6), opacity=0.7,
+                    ),
+                    secondary_y=False,
+                )
+            fig_margin.update_layout(
+                title='Маржа чистая % по месяцам',
+                height=380, hovermode='x unified',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                margin=dict(t=60, b=20),
+            )
+            fig_margin.update_yaxes(title_text='Маржа %', secondary_y=False)
+            st.plotly_chart(fig_margin, use_container_width=True)
+
+            # График 2: прибыль ₽ стек-баром
+            fig_profit = go.Figure()
+            for art in selected_sorted:
+                art_data = unit_month[unit_month['Артикул'] == art].sort_values('period_start')
+                if art_data.empty:
+                    continue
+                fig_profit.add_trace(go.Bar(
+                    name=art,
+                    x=art_data['month_label'], y=art_data['Прибыль чистая'],
+                    marker_color=ARTICLE_COLOR.get(art, '#999'),
+                ))
+            fig_profit.update_layout(
+                title='Прибыль чистая ₽ по месяцам (стек по SKU)',
+                barmode='stack', height=380,
+                yaxis_title='Прибыль ₽',
+                hovermode='x unified',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                margin=dict(t=60, b=20),
+            )
+            st.plotly_chart(fig_profit, use_container_width=True)
+
+            # Heatmap SKU × месяц
+            if len(months_ordered) > 0 and len(selected_sorted) > 0:
+                pivot_margin = (
+                    unit_month.pivot_table(
+                        index='Артикул', columns='month_label', values='Маржа %', aggfunc='mean'
+                    )
+                    .reindex(index=[a for a in selected_sorted if a in unit_month['Артикул'].values],
+                             columns=months_ordered)
+                )
+                if not pivot_margin.empty:
+                    fig_hm = go.Figure(data=go.Heatmap(
+                        z=pivot_margin.values,
+                        x=pivot_margin.columns, y=pivot_margin.index,
+                        colorscale=[[0, '#c0392b'], [0.4, '#f39c12'], [0.6, '#f1c40f'],
+                                    [0.8, '#2ecc71'], [1.0, '#27ae60']],
+                        zmin=0, zmax=60,
+                        text=[[f'{v:.1f}%' if pd.notna(v) else '' for v in row] for row in pivot_margin.values],
+                        texttemplate='%{text}', textfont={'size': 11},
+                        colorbar=dict(title='Маржа %'),
+                    ))
+                    fig_hm.update_layout(
+                        title='Маржа % — SKU × месяц',
+                        height=max(280, 40 * len(pivot_margin) + 100),
+                        margin=dict(t=60, b=20),
+                    )
+                    st.plotly_chart(fig_hm, use_container_width=True)
+
+        # ── Таб 2: Структура расходов ──
+        with tab_struct:
+            # Селектор SKU
+            sku_options = ['Все выбранные'] + [a for a in selected_sorted if a in unit_sel['Артикул'].values]
+            sku_choice = st.selectbox('Артикул для waterfall', sku_options, index=0)
+            if sku_choice == 'Все выбранные':
+                wf_df = unit_sel
+            else:
+                wf_df = unit_sel[unit_sel['Артикул'] == sku_choice]
+
+            # В файле Озон расходы хранятся со знаком минус. Передаём их так
+            # же — Plotly Waterfall с measure='relative' нарисует красный бар
+            # вниз для отрицательного значения и зелёный вверх для положительного.
+            wf_revenue = wf_df['Выручка'].sum()
+            wf_compensation = wf_df['Баллы за скидки'].sum() + wf_df['Программы партнёров'].sum()
+            wf_commission = wf_df['Вознаграждение Ozon'].sum() + wf_df['Эквайринг'].sum()
+            wf_logistics = wf_df[['Логистика', 'Доставка до ПВЗ',
+                                  'Обработка отправления', 'Стоимость размещения']].sum().sum()
+            wf_returns = wf_df[['Обработка возврата', 'Обратная логистика']].sum().sum()
+            wf_ads = wf_df[['Оплата за клик', 'Оплата за заказ']].sum().sum()
+            wf_cogs = -(wf_df['Чистая_продано_шт'].sum() * cost_per_unit)
+
+            wf_total = (wf_revenue + wf_compensation + wf_commission
+                        + wf_logistics + wf_returns + wf_ads + wf_cogs)
+            wf_steps = [
+                ('Выручка', wf_revenue, 'absolute'),
+                ('+ Компенсации', wf_compensation, 'relative'),
+                ('− Комиссия Озон', wf_commission, 'relative'),
+                ('− Логистика', wf_logistics, 'relative'),
+                ('− Возвраты', wf_returns, 'relative'),
+                ('− Реклама', wf_ads, 'relative'),
+                ('− Себестоимость', wf_cogs, 'relative'),
+                ('Прибыль чистая', wf_total, 'total'),
+            ]
+            fig_wf = go.Figure(go.Waterfall(
+                measure=[s[2] for s in wf_steps],
+                x=[s[0] for s in wf_steps],
+                y=[s[1] for s in wf_steps],
+                text=[f'{v:,.0f} ₽'.replace(',', ' ') for _, v, _ in wf_steps],
+                textposition='outside',
+                connector=dict(line=dict(color='#bbb')),
+                increasing=dict(marker=dict(color='#27ae60')),
+                decreasing=dict(marker=dict(color='#e74c3c')),
+                totals=dict(marker=dict(color='#2c3e50')),
+            ))
+            fig_wf.update_layout(
+                title=f'Куда уходит выручка ({sku_choice})',
+                height=420, yaxis_title='₽',
+                margin=dict(t=60, b=20),
+            )
+            st.plotly_chart(fig_wf, use_container_width=True)
+
+            # Стек-бар 100% — структура расходов по месяцам
+            if len(months_ordered := sorted(unit_sel['month_label'].unique(),
+                                             key=lambda m: unit_sel[unit_sel['month_label'] == m]['period_start'].min())) > 1:
+                by_month_struct = []
+                for m in months_ordered:
+                    md = unit_sel[unit_sel['month_label'] == m]
+                    rev = md['Выручка'].sum()
+                    if rev <= 0:
+                        continue
+                    by_month_struct.append({
+                        'Месяц': m,
+                        'Комиссия': -(md['Вознаграждение Ozon'].sum() + md['Эквайринг'].sum()) / rev * 100,
+                        'Логистика': -md[['Логистика', 'Доставка до ПВЗ', 'Обработка отправления',
+                                          'Стоимость размещения']].sum().sum() / rev * 100,
+                        'Возвраты': -md[['Обработка возврата', 'Обратная логистика']].sum().sum() / rev * 100,
+                        'Реклама': -md[['Оплата за клик', 'Оплата за заказ']].sum().sum() / rev * 100,
+                        'COGS': ((md['Доставлено'] - md['Возвращено']).sum() * cost_per_unit) / rev * 100,
+                    })
+                if by_month_struct:
+                    struct_df = pd.DataFrame(by_month_struct)
+                    struct_df['Прибыль'] = (
+                        100 - struct_df[['Комиссия', 'Логистика', 'Возвраты', 'Реклама', 'COGS']].sum(axis=1)
+                    )
+                    fig_struct = go.Figure()
+                    palette = {'Комиссия': '#e74c3c', 'Логистика': '#e67e22',
+                               'Возвраты': '#9b59b6', 'Реклама': '#3498db',
+                               'COGS': '#95a5a6', 'Прибыль': '#27ae60'}
+                    for cat in ['Комиссия', 'Логистика', 'Возвраты', 'Реклама', 'COGS', 'Прибыль']:
+                        fig_struct.add_trace(go.Bar(
+                            name=cat, x=struct_df['Месяц'], y=struct_df[cat],
+                            marker_color=palette[cat],
+                            text=[f'{v:.1f}%' for v in struct_df[cat]],
+                            textposition='inside',
+                        ))
+                    fig_struct.update_layout(
+                        barmode='stack', height=380,
+                        title='Структура расходов в % выручки помесячно',
+                        yaxis_title='% выручки',
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                        margin=dict(t=60, b=20),
+                    )
+                    st.plotly_chart(fig_struct, use_container_width=True)
+
+        # ── Таб 3: Упущенная прибыль ──
+        with tab_lost:
+            st.caption(
+                'Упущенная прибыль = упущенная выручка из раздела «Стокауты» × маржа чистая % этого SKU. '
+                'Переводит «упущенные продажи» в «упущенные деньги в кармане».'
+            )
+
+            margin_by_art = {}
+            fallback_arts = []
+            for art in selected_sorted:
+                art_unit = unit_sel[unit_sel['Артикул'] == art]
+                if art_unit.empty:
+                    margin_by_art[art] = u_margin_net  # fallback: агрегатная маржа
+                    fallback_arts.append(art)
+                else:
+                    art_rev = art_unit['Выручка'].sum()
+                    art_net = art_unit['Прибыль чистая'].sum()
+                    margin_by_art[art] = (art_net / art_rev * 100) if art_rev > 0 else 0
+
+            lost_rows = []
+            for art in selected_sorted:
+                lost_rev = sum(lost_data.get(art, {}).values())
+                if lost_rev <= 0:
+                    continue
+                m = margin_by_art.get(art, u_margin_net)
+                lost_profit = lost_rev * m / 100
+                lost_rows.append({
+                    'Артикул': art,
+                    'Упущенная выручка, ₽': lost_rev,
+                    'Маржа чистая %': m,
+                    'Упущенная прибыль, ₽': lost_profit,
+                })
+
+            # Сноска про fallback-маржу, если есть SKU без своих unit-данных.
+            # Сейчас это, например, 06SK2024 в апреле (полный стокаут → нет
+            # его строки в Юнит-экономика_Апрель), и для него используем
+            # агрегатную маржу всего периода.
+            fallback_lost = [a for a in fallback_arts
+                             if sum(lost_data.get(a, {}).values()) > 0]
+            if fallback_lost:
+                st.caption(
+                    f'ℹ️ Для **{", ".join(fallback_lost)}** в этом периоде нет unit-данных '
+                    f'(например, полный стокаут). Используем агрегатную маржу периода ({u_margin_net:.1f}%) '
+                    'как оценку — реальная маржа этих SKU могла бы отличаться.'
+                )
+
+            if not lost_rows:
+                st.success('За выбранный период упущенной выручки нет — все артикулы продавались без стокаутов.')
+            else:
+                lost_df = pd.DataFrame(lost_rows).sort_values('Упущенная прибыль, ₽', ascending=False)
+                total_lost_profit = lost_df['Упущенная прибыль, ₽'].sum()
+                total_lost_rev = lost_df['Упущенная выручка, ₽'].sum()
+                _rev_s = f'{total_lost_rev:,.0f}'.replace(',', ' ')
+                _prof_s = f'{total_lost_profit:,.0f}'.replace(',', ' ')
+
+                st.markdown(
+                    f'<div style="display:flex;gap:24px;margin-bottom:12px">'
+                    f'<div><div style="font-size:11px;color:#888;text-transform:uppercase">Упущ. выручка</div>'
+                    f'<div style="font-size:22px;font-weight:700;color:#888">{_rev_s} ₽</div></div>'
+                    f'<div><div style="font-size:11px;color:#888;text-transform:uppercase">Упущ. прибыль</div>'
+                    f'<div style="font-size:22px;font-weight:700;color:#c0392b">{_prof_s} ₽</div></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                _max_lp = lost_df['Упущенная прибыль, ₽'].max()
+
+                def _heat_lp(val):
+                    if pd.isna(val) or val <= 0 or _max_lp <= 0:
+                        return ''
+                    intensity = min(val / _max_lp, 1.0)
+                    # от светло-розового к насыщенному красному
+                    r, g, b = 254, int(232 - 90 * intensity), int(232 - 130 * intensity)
+                    return f'background-color: rgb({r},{g},{b}); color: #333'
+
+                lost_styled = (
+                    lost_df.style
+                    .format({
+                        'Упущенная выручка, ₽': '{:,.0f}',
+                        'Маржа чистая %': '{:.1f}%',
+                        'Упущенная прибыль, ₽': '{:,.0f}',
+                    })
+                    .map(_heat_lp, subset=['Упущенная прибыль, ₽'])
+                )
+                st.dataframe(lost_styled, use_container_width=True, hide_index=True)
