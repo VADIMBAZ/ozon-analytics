@@ -1521,9 +1521,9 @@ else:
 """)
                     st.plotly_chart(fig_hm, use_container_width=True)
 
-            # ── Таблица: Прибыль на штуку (SKU × месяц) + среднее ──
-            # Маржа % уже выше показывает эффективность. Эта таблица показывает
-            # «сколько рублей оставила одна проданная штука» — конкретно, в ₽.
+            # ── Тепловая карта: Прибыль на штуку (SKU × месяц) + среднее ──
+            # Формат — Plotly Heatmap, точно как у маржи % выше. Главное отличие:
+            # порог «зелёного» — 150 ₽/шт (целевой уровень с одной продажи).
             import numpy as _np
             _denom = unit_month['Чистая_продано_шт'].replace(0, _np.nan)
             unit_month['Прибыль_на_шт'] = unit_month['Прибыль чистая'] / _denom
@@ -1539,14 +1539,9 @@ else:
                 .astype('float64')
             )
             if not pivot_pps.empty:
-                # Принудительно приводим всё к float64 — иначе остаются None
-                # вперемешку с NaN, и styler пишет «None» в ячейках без данных.
-                pivot_pps_display = pivot_pps.apply(pd.to_numeric, errors='coerce')
-                pivot_pps_display['Средняя/мес'] = pivot_pps_display.mean(axis=1, skipna=True)
-                # Убираем имена осей (month_label, Артикул) — они создают лишнюю
-                # строку и колонку в шапке HTML-таблицы.
-                pivot_pps_display.columns.name = None
-                pivot_pps_display.index.name = None
+                # «Средняя/мес» становится последней колонкой того же heatmap.
+                pivot_pps_with_avg = pivot_pps.copy()
+                pivot_pps_with_avg['Средняя/мес'] = pivot_pps.mean(axis=1, skipna=True)
 
                 _t, _i = st.columns([10, 1])
                 _t.markdown('**Прибыль на штуку, ₽ (SKU × месяц)**')
@@ -1556,65 +1551,58 @@ else:
 
 **Что показывает:** сколько рублей оставила в кармане **одна проданная копия** ключа за этот месяц. Учитывает все расходы Озона и себестоимость из сайдбара.
 
-Колонка **«Средняя/мес»** справа — среднее значение по строке за все месяцы периода. Удобно для ранжирования SKU: какой ключ системно зарабатывает больше с одной продажи.
+Колонка **«Средняя/мес»** справа — среднее значение по строке за все месяцы периода. Удобно для ранжирования SKU.
 
-**Цветовая шкала** (порог = 150 ₽/шт — целевая прибыль с продажи):
+**Цветовая шкала** (та же палитра, что в heatmap маржи % выше — порог 150 ₽/шт):
 
-- 🔴 **< 0 ₽** — товар работал в минус (отрицательная маржа после COGS).
-- 🟡 **0–149 ₽** — заработок ниже цели (жёлто-оранжевый, насыщеннее при значениях ближе к нулю).
-- 🟢 **≥ 150 ₽** — заработок на цели или выше (зелёный, насыщеннее при значениях выше).
+| Значение | Цвет |
+|---|---|
+| ≤ 0 ₽ | 🔴 красный — товар работал в минус |
+| ~60 ₽ | 🟠 оранжевый — низкий заработок |
+| ~90 ₽ | 🟡 жёлтый — средний |
+| ~120 ₽ | 🟢 зелёный — близко к цели |
+| ≥ 150 ₽ | 🟢 тёмно-зелёный — целевой уровень |
 
 Пустая клетка = нет unit-данных за этот месяц (например, артикул в стокауте).
 """)
 
-                # Порог 150 ₽/шт = «целевой уровень».
-                #   < 0      → красный (товар работал в минус)
-                #   0..149   → жёлто-оранжевый (ниже цели)
-                #   ≥ 150    → зелёный (на цели или выше)
-                # Внутри каждой зоны — лёгкий градиент насыщенности.
-                def _color_pps(v):
-                    if pd.isna(v):
-                        return ''
-                    if v < 0:
-                        # Тёмный красный, насыщеннее при больших отрицательных
-                        intensity = min(abs(v) / 50, 1.0)
-                        r = 254
-                        g = int(180 - 50 * intensity)
-                        b = int(180 - 50 * intensity)
-                    elif v < 150:
-                        # Жёлто-оранжевая зона: от красноватого (0) к жёлтому (149)
-                        t = v / 150  # 0..1
-                        r = 254
-                        g = int(220 + 30 * t)
-                        b = int(170 + 20 * t)
-                    else:
-                        # Зелёная зона: от светло-зелёного (150) к насыщенному (300+)
-                        t = min((v - 150) / 150, 1.0)
-                        r = int(230 - 90 * t)
-                        g = int(245 - 20 * t)
-                        b = int(220 - 90 * t)
-                    return f'background-color: rgb({r},{g},{b}); color: #333'
-
-                def _fmt_pps(v):
-                    if pd.isna(v):
-                        return '—'
-                    return f'{int(round(float(v))):,}'.replace(',', ' ')
-
-                styled_pps = (
-                    pivot_pps_display.style
-                    .format(_fmt_pps)
-                    .map(_color_pps)
-                    .map(lambda v: 'font-weight: 700' if pd.notna(v) else '',
-                         subset=['Средняя/мес'])
-                    .set_table_styles([
-                        {'selector': 'th', 'props': 'background:#f5f5f5; padding:6px 10px; text-align:right; font-size:12px;'},
-                        {'selector': 'td', 'props': 'padding:6px 10px; text-align:right; font-size:13px;'},
-                        {'selector': 'table', 'props': 'border-collapse:collapse; width:100%;'},
-                    ])
+                # Палитра + zmax=200 подобраны так, чтобы 150 ₽ соответствовал
+                # позиции 0.75 на шкале (тёмно-зелёный) — как 50% маржи у heatmap
+                # выше. Узлы (₽/шт → позиция на шкале):
+                #     0   → 0.00  красный   #c0392b
+                #    60   → 0.30  оранжевый #f39c12
+                #    90   → 0.45  жёлтый    #f1c40f
+                #   120   → 0.60  зелёный   #2ecc71
+                #   150+  → 0.75  тёмно-зел #27ae60
+                fig_pps = go.Figure(data=go.Heatmap(
+                    z=pivot_pps_with_avg.values,
+                    x=list(pivot_pps_with_avg.columns),
+                    y=list(pivot_pps_with_avg.index),
+                    colorscale=[
+                        [0.00, '#c0392b'],
+                        [0.30, '#f39c12'],
+                        [0.45, '#f1c40f'],
+                        [0.60, '#2ecc71'],
+                        [0.75, '#27ae60'],
+                        [1.00, '#27ae60'],
+                    ],
+                    zmin=0, zmax=200,
+                    text=[
+                        [f'{int(round(v)):,}'.replace(',', ' ') if pd.notna(v) else ''
+                         for v in row]
+                        for row in pivot_pps_with_avg.values
+                    ],
+                    texttemplate='%{text}',
+                    textfont={'size': 11},
+                    colorbar=dict(title='₽/шт'),
+                    hovertemplate='%{y} · %{x}<br>%{z:.0f} ₽/шт<extra></extra>',
+                ))
+                fig_pps.update_layout(
+                    height=max(280, 40 * len(pivot_pps_with_avg) + 100),
+                    margin=dict(t=20, b=20),
+                    xaxis=dict(side='bottom'),
                 )
-                # to_html, потому что st.dataframe (Glide canvas) не уважает
-                # format-функцию для NaN и рисует «None» в пустых ячейках.
-                st.markdown(styled_pps.to_html(), unsafe_allow_html=True)
+                st.plotly_chart(fig_pps, use_container_width=True)
 
         # ── Таб 2: Структура расходов ──
         with tab_struct:
