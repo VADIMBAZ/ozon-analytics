@@ -1419,9 +1419,8 @@ else:
 
             st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
-            # ── 2B: Waterfall — итоговая раскладка за период ──
-            st.markdown('**Итог за выбранный период:**')
-            # Селектор SKU
+            # ── 2B: Waterfall помесячно — отдельный мини-водопад на каждый месяц ──
+            st.markdown('**Куда уходит выручка — помесячно:**')
             sku_options = ['Все выбранные'] + [a for a in selected_sorted if a in unit_sel['Артикул'].values]
             sku_choice = st.selectbox('Артикул для waterfall', sku_options, index=0)
             if sku_choice == 'Все выбранные':
@@ -1429,47 +1428,59 @@ else:
             else:
                 wf_df = unit_sel[unit_sel['Артикул'] == sku_choice]
 
-            # В файле Озон расходы хранятся со знаком минус. Передаём их так
-            # же — Plotly Waterfall с measure='relative' нарисует красный бар
-            # вниз для отрицательного значения и зелёный вверх для положительного.
-            wf_revenue = wf_df['Выручка'].sum()
-            wf_compensation = wf_df['Баллы за скидки'].sum() + wf_df['Программы партнёров'].sum()
-            wf_commission = wf_df['Вознаграждение Ozon'].sum() + wf_df['Эквайринг'].sum()
-            wf_logistics = wf_df[['Логистика', 'Доставка до ПВЗ',
-                                  'Обработка отправления', 'Стоимость размещения']].sum().sum()
-            wf_returns = wf_df[['Обработка возврата', 'Обратная логистика']].sum().sum()
-            wf_ads = wf_df[['Оплата за клик', 'Оплата за заказ']].sum().sum()
-            wf_cogs = -(wf_df['Чистая_продано_шт'].sum() * cost_per_unit)
+            # Раскладываем месяцы по сетке — до 4 в строку, дальше переносим.
+            import math as _math
+            wf_steps_x = ['Выручка', '+ Комп.', '− Комиссия', '− Логистика',
+                          '− Возвраты', '− Реклама', '− С/с', 'Прибыль']
+            wf_measures = ['absolute', 'relative', 'relative', 'relative',
+                           'relative', 'relative', 'relative', 'total']
 
-            wf_total = (wf_revenue + wf_compensation + wf_commission
-                        + wf_logistics + wf_returns + wf_ads + wf_cogs)
-            wf_steps = [
-                ('Выручка', wf_revenue, 'absolute'),
-                ('+ Компенсации', wf_compensation, 'relative'),
-                ('− Комиссия Озон', wf_commission, 'relative'),
-                ('− Логистика', wf_logistics, 'relative'),
-                ('− Возвраты', wf_returns, 'relative'),
-                ('− Реклама', wf_ads, 'relative'),
-                ('− Себестоимость', wf_cogs, 'relative'),
-                ('Прибыль чистая', wf_total, 'total'),
-            ]
-            fig_wf = go.Figure(go.Waterfall(
-                measure=[s[2] for s in wf_steps],
-                x=[s[0] for s in wf_steps],
-                y=[s[1] for s in wf_steps],
-                text=[f'{v:,.0f} ₽'.replace(',', ' ') for _, v, _ in wf_steps],
-                textposition='outside',
-                connector=dict(line=dict(color='#bbb')),
-                increasing=dict(marker=dict(color='#27ae60')),
-                decreasing=dict(marker=dict(color='#e74c3c')),
-                totals=dict(marker=dict(color='#2c3e50')),
-            ))
-            fig_wf.update_layout(
-                title=f'Куда уходит выручка ({sku_choice})',
-                height=420, yaxis_title='₽',
-                margin=dict(t=60, b=20),
-            )
-            st.plotly_chart(fig_wf, use_container_width=True)
+            wf_months = [m for m in tab2_months if not wf_df[wf_df['month_label'] == m].empty]
+            n_m = len(wf_months)
+            if n_m == 0:
+                st.info('Нет данных за выбранный артикул и период.')
+            else:
+                wf_cols = min(n_m, 4)
+                wf_rows = _math.ceil(n_m / 4)
+                fig_wf = make_subplots(
+                    rows=wf_rows, cols=wf_cols,
+                    subplot_titles=wf_months,
+                    horizontal_spacing=0.04,
+                    vertical_spacing=0.18 if wf_rows > 1 else 0.1,
+                    shared_yaxes=True,  # одна шкала Y для сравнения месяцев
+                )
+                for i, month in enumerate(wf_months):
+                    md = wf_df[wf_df['month_label'] == month]
+                    rev = md['Выручка'].sum()
+                    comp = md['Баллы за скидки'].sum() + md['Программы партнёров'].sum()
+                    comm = md['Вознаграждение Ozon'].sum() + md['Эквайринг'].sum()
+                    log = md[['Логистика', 'Доставка до ПВЗ',
+                              'Обработка отправления', 'Стоимость размещения']].sum().sum()
+                    ret = md[['Обработка возврата', 'Обратная логистика']].sum().sum()
+                    ads = md[['Оплата за клик', 'Оплата за заказ']].sum().sum()
+                    cogs = -((md['Доставлено'] - md['Возвращено']).sum() * cost_per_unit)
+                    total = rev + comp + comm + log + ret + ads + cogs
+
+                    r_idx = i // 4 + 1
+                    c_idx = i % 4 + 1
+                    fig_wf.add_trace(go.Waterfall(
+                        measure=wf_measures,
+                        x=wf_steps_x,
+                        y=[rev, comp, comm, log, ret, ads, cogs, total],
+                        connector=dict(line=dict(color='#bbb')),
+                        increasing=dict(marker=dict(color='#27ae60')),
+                        decreasing=dict(marker=dict(color='#e74c3c')),
+                        totals=dict(marker=dict(color='#2c3e50')),
+                        showlegend=False,
+                    ), row=r_idx, col=c_idx)
+
+                fig_wf.update_layout(
+                    height=320 * wf_rows + 80,
+                    margin=dict(t=60, b=20),
+                    title=f'Куда уходит выручка по месяцам ({sku_choice})',
+                )
+                fig_wf.update_xaxes(tickangle=-45, tickfont=dict(size=9))
+                st.plotly_chart(fig_wf, use_container_width=True)
 
         # ── Таб 3: Упущенная прибыль ──
         with tab_lost:
