@@ -63,6 +63,96 @@ _delivered = sales[sales['Статус'] == 'Доставлен']
 _sales_rank = _delivered.groupby('Артикул')['Количество'].sum().sort_values(ascending=False)
 all_articles = [a for a in _sales_rank.index if a in sales['Артикул'].dropna().unique()]
 
+# ── Сайдбар: фильтр периода ────────────────────────────────────────────────
+
+PRESET_OPTIONS = [
+    'Весь период',
+    'Последний полный месяц',
+    'Последние 3 месяца',
+    'Последние 6 месяцев',
+    'Последние 12 месяцев',
+    'Кастом',
+]
+DEFAULT_PRESET = 'Последние 3 месяца'
+
+
+def _resolve_period(preset: str, *, analytics_df, sales_df,
+                    custom_from=None, custom_to=None):
+    """Возвращает (start, end) как pd.Timestamp для выбранного пресета.
+
+    Опирается на analytics['period_start'] — для месячных пресетов окно
+    «выравнивается по месяцам», чтобы пользователь видел целые месяцы аналитики.
+    Для «Весь период» — реальный min/max sales.date.
+    """
+    periods = sorted(pd.to_datetime(analytics_df['period_start']).unique())
+    last_p = pd.Timestamp(periods[-1]) if periods else pd.Timestamp(sales_df['date'].max())
+    last_p_end = last_p + pd.offsets.MonthEnd(0)
+
+    if preset == 'Весь период':
+        return pd.Timestamp(sales_df['date'].min()), max(pd.Timestamp(sales_df['date'].max()), last_p_end)
+    if preset == 'Последний полный месяц':
+        return last_p, last_p_end
+    n_map = {'Последние 3 месяца': 3, 'Последние 6 месяцев': 6, 'Последние 12 месяцев': 12}
+    if preset in n_map:
+        n = n_map[preset]
+        start = pd.Timestamp(periods[-n]) if len(periods) >= n else pd.Timestamp(periods[0])
+        return start, last_p_end
+    if preset == 'Кастом':
+        return pd.Timestamp(custom_from), pd.Timestamp(custom_to)
+    raise ValueError(f'Неизвестный пресет: {preset}')
+
+
+def _auto_granularity(start: pd.Timestamp, end: pd.Timestamp) -> str:
+    return 'Неделя' if (end - start).days <= 31 else 'Месяц'
+
+
+def _fmt_window(start: pd.Timestamp, end: pd.Timestamp) -> str:
+    days = (end - start).days + 1
+    if days <= 31:
+        return f'{days} дн'
+    months = round(days / 30.4)
+    if months < 12:
+        return f'{months} мес'
+    years = days / 365.25
+    return f'{years:.1f} года'.replace('.0 года', ' лет')
+
+
+st.sidebar.markdown('### 📅 Период анализа')
+if 'period_preset' not in st.session_state:
+    st.session_state['period_preset'] = DEFAULT_PRESET
+period_preset = st.sidebar.selectbox(
+    'preset', PRESET_OPTIONS,
+    index=PRESET_OPTIONS.index(st.session_state['period_preset']),
+    key='period_preset',
+    label_visibility='collapsed',
+)
+
+custom_from_val = custom_to_val = None
+if period_preset == 'Кастом':
+    _min_date = pd.Timestamp(sales['date'].min()).date()
+    _max_date = pd.Timestamp(sales['date'].max()).date()
+    col_from, col_to = st.sidebar.columns(2)
+    custom_from_val = col_from.date_input(
+        'От', value=_min_date, min_value=_min_date, max_value=_max_date, key='custom_from',
+    )
+    custom_to_val = col_to.date_input(
+        'До', value=_max_date, min_value=_min_date, max_value=_max_date, key='custom_to',
+    )
+    if custom_from_val > custom_to_val:
+        st.sidebar.error('Дата «От» больше «До». Поменяй местами.')
+        st.stop()
+
+period_start, period_end = _resolve_period(
+    period_preset, analytics_df=analytics, sales_df=sales,
+    custom_from=custom_from_val, custom_to=custom_to_val,
+)
+st.sidebar.caption(
+    f'_{period_start:%d.%m.%Y} – {period_end:%d.%m.%Y} · {_fmt_window(period_start, period_end)}_'
+)
+st.sidebar.divider()
+
+# ── Сайдбар: артикулы ──────────────────────────────────────────────────────
+
 # Инициализация состояния
 for art in all_articles:
     if f'art_{art}' not in st.session_state:
@@ -101,7 +191,19 @@ count = len(selected)
 total = len(all_articles)
 st.sidebar.caption(f'Выбрано: {count} из {total}')
 st.sidebar.divider()
-granularity = st.sidebar.radio('Гранулярность', ['Неделя', 'Месяц'], horizontal=True)
+
+# Auto-гранулярность: при смене периода сбрасывается на рекомендованную для окна.
+# Ручной выбор пользователя живёт до следующей смены периода (это компромисс
+# между «удобно для коротких/длинных окон» и «не запутывать»).
+_auto_gran = _auto_granularity(period_start, period_end)
+_period_sig = (period_preset, str(custom_from_val), str(custom_to_val))
+if st.session_state.get('_last_period_sig_for_gran') != _period_sig:
+    st.session_state['granularity'] = _auto_gran
+    st.session_state['_last_period_sig_for_gran'] = _period_sig
+granularity = st.sidebar.radio(
+    'Гранулярность', ['Неделя', 'Месяц'],
+    key='granularity', horizontal=True,
+)
 
 # ── Загрузка отчётов через UI ───────────────────────────────────────────────
 
@@ -193,34 +295,56 @@ if not selected:
     st.warning('Выберите хотя бы один артикул.')
     st.stop()
 
+# ── Применение фильтра периода ──────────────────────────────────────────────
+# Все «фильтруемые» блоки дашборда (KPI, инсайты, графики, упущенная выручка,
+# остатки+приходы, % отмен, сводная таблица) работают на этих DataFrame.
+# «Анализ запасов» использует оригинальные sales/analytics — см. ниже.
+sales_period = sales[(sales['date'] >= period_start) & (sales['date'] <= period_end)].copy()
+analytics_period = analytics[
+    (analytics['period_start'] >= period_start) & (analytics['period_start'] <= period_end)
+].copy()
+
+if sales_period.empty and analytics_period.empty:
+    st.warning(
+        f'В выбранном периоде ({period_start:%d.%m.%Y} – {period_end:%d.%m.%Y}) нет данных. '
+        'Подбери другой период.'
+    )
+    st.stop()
+
 st.markdown('<h1 style="text-align:center">📦 Спутник Ключи — Аналитика Ozon</h1>', unsafe_allow_html=True)
+st.markdown(
+    f'<p style="text-align:center;color:#888;margin-top:-10px;font-size:14px">'
+    f'<em>За период: {period_start:%d.%m.%Y} – {period_end:%d.%m.%Y} · '
+    f'{_fmt_window(period_start, period_end)} · «{period_preset}»</em></p>',
+    unsafe_allow_html=True,
+)
 
 # ── KPI ─────────────────────────────────────────────────────────────────────
 
-delivered_all = sales[sales['Статус'] == 'Доставлен']
-cancelled_all = sales[sales['Статус'] == 'Отменён']
+delivered_all = sales_period[sales_period['Статус'] == 'Доставлен']
+cancelled_all = sales_period[sales_period['Статус'] == 'Отменён']
 
 delivered_sel = delivered_all[delivered_all['Артикул'].isin(selected)]
 cancelled_sel = cancelled_all[cancelled_all['Артикул'].isin(selected)]
-total_orders = sales[sales['Артикул'].isin(selected)]['Количество'].sum()
+total_orders = sales_period[sales_period['Артикул'].isin(selected)]['Количество'].sum()
 revenue = delivered_sel['Оплачено покупателем'].sum()
 
-# Дельты к прошлому месяцу
-_sel_sales = sales[sales['Артикул'].isin(selected)].copy()
-_sel_sales['_month'] = _sel_sales['date'].dt.to_period('M')
-_months_sorted = sorted(_sel_sales['_month'].dropna().unique())
-if len(_months_sorted) >= 2:
-    _last_m, _prev_m = _months_sorted[-1], _months_sorted[-2]
-    _cur = _sel_sales[_sel_sales['_month'] == _last_m]
-    _prv = _sel_sales[_sel_sales['_month'] == _prev_m]
-    _cur_dlv = _cur[_cur['Статус'] == 'Доставлен']
-    _prv_dlv = _prv[_prv['Статус'] == 'Доставлен']
-    _cur_canc = _cur[_cur['Статус'] == 'Отменён']
-    _prv_canc = _prv[_prv['Статус'] == 'Отменён']
-    _d_orders = int(_cur['Количество'].sum() - _prv['Количество'].sum())
-    _d_dlv = int(_cur_dlv['Количество'].sum() - _prv_dlv['Количество'].sum())
-    _d_canc = int(_cur_canc['Количество'].sum() - _prv_canc['Количество'].sum())
-    _d_rev = _cur_dlv['Оплачено покупателем'].sum() - _prv_dlv['Оплачено покупателем'].sum()
+# Дельты vs предыдущее окно такой же длины.
+# Если предыдущее окно не помещается в исторические данные — дельты скрываются.
+_window_days = (period_end - period_start).days
+_prev_end = period_start - pd.Timedelta(days=1)
+_prev_start = _prev_end - pd.Timedelta(days=_window_days)
+if _prev_start >= pd.Timestamp(sales['date'].min()):
+    _prv_sales = sales[
+        (sales['date'] >= _prev_start) & (sales['date'] <= _prev_end) &
+        (sales['Артикул'].isin(selected))
+    ]
+    _prv_dlv = _prv_sales[_prv_sales['Статус'] == 'Доставлен']
+    _prv_canc = _prv_sales[_prv_sales['Статус'] == 'Отменён']
+    _d_orders = int(total_orders - _prv_sales['Количество'].sum())
+    _d_dlv = int(delivered_sel['Количество'].sum() - _prv_dlv['Количество'].sum())
+    _d_canc = int(cancelled_sel['Количество'].sum() - _prv_canc['Количество'].sum())
+    _d_rev = revenue - _prv_dlv['Оплачено покупателем'].sum()
     _d_orders_s = f"{_d_orders:+,}".replace(',', ' ')
     _d_dlv_s = f"{_d_dlv:+,}".replace(',', ' ')
     _d_canc_s = f"{_d_canc:+,}".replace(',', ' ')
@@ -399,7 +523,7 @@ def build_insights(sales_df, analytics_df, selected_arts):
 
 
 with st.expander('💡 Аналитические наблюдения', expanded=True):
-    insights = build_insights(sales, analytics, selected)
+    insights = build_insights(sales_period, analytics_period, selected)
     if insights:
         for note in insights:
             st.markdown(f"- {note}")
@@ -437,7 +561,11 @@ grouped = (
     .reset_index()
 )
 
-analytics_sel = analytics[analytics['Артикул'].isin(selected)]
+# Для фильтруемых блоков (упущенная выручка, остатки+приходы, сводная таблица) —
+# analytics, обрезанный фильтром периода. Для «Анализа запасов» отдельно
+# используем analytics_full_sel (вся история, см. ниже).
+analytics_sel = analytics_period[analytics_period['Артикул'].isin(selected)]
+analytics_full_sel = analytics[analytics['Артикул'].isin(selected)]
 month_order = analytics_sel.drop_duplicates('month_label').sort_values('period_start')['month_label'].tolist()
 
 
@@ -533,7 +661,25 @@ pivot_dlv = analytics_sel.pivot_table(
     values='Доставлено', aggfunc='first'
 ).reindex(columns=month_order).reindex(selected_sorted)
 
-# Рассчитываем упущенную выручку
+# Рассчитываем упущенную выручку.
+# avg_monthly_sales берём по ВСЕЙ истории артикула (analytics_full_sel), а не
+# только по выбранному окну (analytics_period). Иначе при фильтре «Последние 3 месяца»
+# у артикулов с хроническим дефицитом или коротким окном вся «нормальная» база
+# отрезается, avg=0, и потери исчезают — даже там, где они явно были.
+# Потери же считаются только по месяцам внутри окна (month_order).
+_normal_avg_global = {}
+for art in selected_sorted:
+    art_full = analytics_full_sel[analytics_full_sel['Артикул'] == art]
+    normal = []
+    for _, r in art_full.iterrows():
+        stock_end = r['остаток_конец']
+        dlv_val = r['Доставлено']
+        if pd.isna(dlv_val) or dlv_val <= 0:
+            continue
+        if pd.notna(stock_end) and stock_end >= dlv_val:
+            normal.append(dlv_val)
+    _normal_avg_global[art] = sum(normal) / len(normal) if normal else 0
+
 # Логика: если остаток_конец < средних_продаж → товар закончился раньше конца месяца
 # Упущено = (средние_продажи − фактические_продажи) × средний_чек
 lost_data = {}
@@ -544,27 +690,7 @@ for art in selected_sorted:
     stock_row = pivot_stock_end.loc[art]
     dlv_row = pivot_dlv.loc[art]
     avg_check = _avg_check.get(art, 0)
-
-    # Шаг 1: определяем «нормальные» месяцы — где остаток_конец >= продаж
-    # (товар не заканчивался, продажи не ограничены стоком)
-    all_dlv = []
-    for month in month_order:
-        stock_end = stock_row.get(month, None)
-        dlv_val = dlv_row.get(month, 0)
-        if pd.notna(dlv_val) and dlv_val > 0:
-            all_dlv.append(dlv_val)
-
-    # Средние продажи — берём из месяцев где остаток >= доставлено (товар не заканчивался)
-    normal_months_dlv = []
-    for month in month_order:
-        stock_end = stock_row.get(month, None)
-        dlv_val = dlv_row.get(month, 0)
-        if pd.isna(dlv_val) or dlv_val <= 0:
-            continue
-        if pd.notna(stock_end) and stock_end >= dlv_val:
-            normal_months_dlv.append(dlv_val)
-
-    avg_monthly_sales = sum(normal_months_dlv) / len(normal_months_dlv) if normal_months_dlv else 0
+    avg_monthly_sales = _normal_avg_global.get(art, 0)
 
     # Шаг 2: считаем потери.
     # ВАЖНО: NaN в остаток_конец означает «товара физически нет на складе» (в xlsx стоит «–»),
@@ -639,7 +765,7 @@ fig_lost.update_layout(
 st.plotly_chart(fig_lost, use_container_width=True)
 
 # Итог + топ потерь
-st.markdown(f'**Итого упущено за весь период: {total_lost_all:,.0f} ₽**'.replace(',', ' '))
+st.markdown(f'**Итого упущено за выбранный период: {total_lost_all:,.0f} ₽**'.replace(',', ' '))
 
 top_lost = sorted(
     [(art, sum(months.values())) for art, months in lost_data.items()],
@@ -734,11 +860,29 @@ fig2.update_yaxes(title_text='шт', row=2, col=1)
 st.plotly_chart(fig2, use_container_width=True)
 
 # ── Анализ запасов (карточки) ────────────────────────────────────────────────
+# В отличие от других блоков, «запасы» — это **состояние** склада, а не поток.
+# Берём всю историю (analytics_full_sel), а не отфильтрованную по периоду.
+# Это сознательное решение из дизайн-документа (docs/plans/2026-05-14-period-filter-design.md).
 
 st.subheader('Анализ запасов')
 
-last_month_an = analytics_sel[analytics_sel['period_start'] == analytics_sel['period_start'].max()]
-avg_monthly_dlv = analytics_sel.groupby('Артикул')['Доставлено'].mean()
+_stock_last_month = analytics_full_sel['period_start'].max() if not analytics_full_sel.empty else None
+_stock_label = (
+    analytics_full_sel[analytics_full_sel['period_start'] == _stock_last_month]['month_label'].iloc[0]
+    if _stock_last_month is not None and not analytics_full_sel.empty else '—'
+)
+st.caption(
+    f'ℹ️ _Состояние склада на конец **{_stock_label}** — независимо от фильтра периода._'
+)
+
+last_month_an = analytics_full_sel[analytics_full_sel['period_start'] == _stock_last_month]
+avg_monthly_dlv = analytics_full_sel.groupby('Артикул')['Доставлено'].mean()
+# Средняя цена по ВСЕЙ истории, не по выбранному периоду — иначе при коротком окне
+# (например, «Последний полный месяц» без продаж артикула) price_per=0 и
+# «розничная цена замороженного» рисуется нулём.
+_delivered_full_sel = sales[
+    (sales['Статус'] == 'Доставлен') & (sales['Артикул'].isin(selected))
+]
 
 # Собираем данные без дубликатов
 stock_cards = {}
@@ -758,7 +902,7 @@ for _, row in last_month_an.iterrows():
     if pd.isna(stock):
         stock = 0
     months_cover = stock / avg
-    avg_price = delivered_sel[delivered_sel['Артикул'] == art]
+    avg_price = _delivered_full_sel[_delivered_full_sel['Артикул'] == art]
     if len(avg_price) > 0:
         total_rev = avg_price['Оплачено покупателем'].sum()
         total_qty = avg_price['Количество'].sum()
@@ -892,7 +1036,7 @@ st.divider()
 
 st.subheader('📊 Процент отмен по артикулам')
 
-_orders_by_art = sales[sales['Артикул'].isin(selected)].groupby('Артикул')['Количество'].sum()
+_orders_by_art = sales_period[sales_period['Артикул'].isin(selected)].groupby('Артикул')['Количество'].sum()
 _canc_by_art = cancelled_sel.groupby('Артикул')['Количество'].sum()
 cancel_data = []
 for art in selected_sorted:
