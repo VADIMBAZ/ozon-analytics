@@ -1322,24 +1322,27 @@ else:
             )
             st.plotly_chart(fig_margin, use_container_width=True)
 
-            # График 2: прибыль ₽ стек-баром
-            fig_profit = go.Figure()
-            for art in selected_sorted:
-                art_data = unit_month[unit_month['Артикул'] == art].sort_values('period_start')
-                if art_data.empty:
-                    continue
-                fig_profit.add_trace(go.Bar(
-                    name=art,
-                    x=art_data['month_label'], y=art_data['Прибыль чистая'],
-                    marker_color=ARTICLE_COLOR.get(art, '#999'),
-                ))
+            # График 2: чистая прибыль ₽ по месяцам — один бар на месяц,
+            # сумма подписана сверху. Детализация по SKU — в heatmap ниже.
+            profit_by_month = (
+                unit_month.groupby(['period_start', 'month_label'])['Прибыль чистая']
+                .sum().reset_index().sort_values('period_start')
+            )
+            fig_profit = go.Figure(go.Bar(
+                x=profit_by_month['month_label'],
+                y=profit_by_month['Прибыль чистая'],
+                marker_color='#27ae60',
+                text=[f'{v:,.0f} ₽'.replace(',', ' ') for v in profit_by_month['Прибыль чистая']],
+                textposition='outside',
+                textfont=dict(size=12),
+                hovertemplate='%{x}<br>Прибыль: %{y:,.0f} ₽<extra></extra>',
+            ))
             fig_profit.update_layout(
-                title='Прибыль чистая ₽ по месяцам (стек по SKU)',
-                barmode='stack', height=420,
+                title='Прибыль чистая ₽ по месяцам',
+                height=380,
                 yaxis_title='Прибыль ₽',
-                hovermode='x unified',
-                legend=dict(orientation='h', yanchor='top', y=-0.15),
-                margin=dict(t=50, b=100),
+                margin=dict(t=50, b=30),
+                showlegend=False,
             )
             st.plotly_chart(fig_profit, use_container_width=True)
 
@@ -1372,6 +1375,53 @@ else:
 
         # ── Таб 2: Структура расходов ──
         with tab_struct:
+            # ── 2A: Помесячная динамика расходов в ₽ (главный график) ──
+            # Один бар = один месяц, делится по статьям. Видно, как менялись
+            # категории расходов от месяца к месяцу.
+            tab2_months = sorted(unit_sel['month_label'].unique(),
+                                 key=lambda m: unit_sel[unit_sel['month_label'] == m]['period_start'].min())
+            by_month_abs = []
+            for m in tab2_months:
+                md = unit_sel[unit_sel['month_label'] == m]
+                by_month_abs.append({
+                    'Месяц': m,
+                    'Комиссия Озон': -(md['Вознаграждение Ozon'].sum() + md['Эквайринг'].sum()),
+                    'Логистика': -md[['Логистика', 'Доставка до ПВЗ',
+                                       'Обработка отправления', 'Стоимость размещения']].sum().sum(),
+                    'Возвраты': -md[['Обработка возврата', 'Обратная логистика']].sum().sum(),
+                    'Реклама': -md[['Оплата за клик', 'Оплата за заказ']].sum().sum(),
+                    'Себестоимость': (md['Доставлено'] - md['Возвращено']).sum() * cost_per_unit,
+                    'Прибыль чистая': md['Прибыль за период'].sum()
+                                       - (md['Доставлено'] - md['Возвращено']).sum() * cost_per_unit,
+                })
+            abs_df = pd.DataFrame(by_month_abs)
+            palette_struct = {
+                'Комиссия Озон': '#e74c3c', 'Логистика': '#e67e22',
+                'Возвраты': '#9b59b6', 'Реклама': '#3498db',
+                'Себестоимость': '#95a5a6', 'Прибыль чистая': '#27ae60',
+            }
+            fig_struct_abs = go.Figure()
+            for cat in ['Комиссия Озон', 'Логистика', 'Возвраты', 'Реклама', 'Себестоимость', 'Прибыль чистая']:
+                fig_struct_abs.add_trace(go.Bar(
+                    name=cat, x=abs_df['Месяц'], y=abs_df[cat],
+                    marker_color=palette_struct[cat],
+                    text=[f'{v:,.0f}'.replace(',', ' ') if v > 1000 else '' for v in abs_df[cat]],
+                    textposition='inside', textfont=dict(size=10, color='white'),
+                ))
+            fig_struct_abs.update_layout(
+                barmode='stack', height=440,
+                title='Расходы и прибыль помесячно, ₽ (стек по статьям)',
+                yaxis_title='₽',
+                hovermode='x unified',
+                legend=dict(orientation='h', yanchor='top', y=-0.15),
+                margin=dict(t=50, b=80),
+            )
+            st.plotly_chart(fig_struct_abs, use_container_width=True)
+
+            st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+            # ── 2B: Waterfall — итоговая раскладка за период ──
+            st.markdown('**Итог за выбранный период:**')
             # Селектор SKU
             sku_options = ['Все выбранные'] + [a for a in selected_sorted if a in unit_sel['Артикул'].values]
             sku_choice = st.selectbox('Артикул для waterfall', sku_options, index=0)
@@ -1421,49 +1471,6 @@ else:
                 margin=dict(t=60, b=20),
             )
             st.plotly_chart(fig_wf, use_container_width=True)
-
-            # Стек-бар 100% — структура расходов по месяцам
-            if len(months_ordered := sorted(unit_sel['month_label'].unique(),
-                                             key=lambda m: unit_sel[unit_sel['month_label'] == m]['period_start'].min())) > 1:
-                by_month_struct = []
-                for m in months_ordered:
-                    md = unit_sel[unit_sel['month_label'] == m]
-                    rev = md['Выручка'].sum()
-                    if rev <= 0:
-                        continue
-                    by_month_struct.append({
-                        'Месяц': m,
-                        'Комиссия': -(md['Вознаграждение Ozon'].sum() + md['Эквайринг'].sum()) / rev * 100,
-                        'Логистика': -md[['Логистика', 'Доставка до ПВЗ', 'Обработка отправления',
-                                          'Стоимость размещения']].sum().sum() / rev * 100,
-                        'Возвраты': -md[['Обработка возврата', 'Обратная логистика']].sum().sum() / rev * 100,
-                        'Реклама': -md[['Оплата за клик', 'Оплата за заказ']].sum().sum() / rev * 100,
-                        'COGS': ((md['Доставлено'] - md['Возвращено']).sum() * cost_per_unit) / rev * 100,
-                    })
-                if by_month_struct:
-                    struct_df = pd.DataFrame(by_month_struct)
-                    struct_df['Прибыль'] = (
-                        100 - struct_df[['Комиссия', 'Логистика', 'Возвраты', 'Реклама', 'COGS']].sum(axis=1)
-                    )
-                    fig_struct = go.Figure()
-                    palette = {'Комиссия': '#e74c3c', 'Логистика': '#e67e22',
-                               'Возвраты': '#9b59b6', 'Реклама': '#3498db',
-                               'COGS': '#95a5a6', 'Прибыль': '#27ae60'}
-                    for cat in ['Комиссия', 'Логистика', 'Возвраты', 'Реклама', 'COGS', 'Прибыль']:
-                        fig_struct.add_trace(go.Bar(
-                            name=cat, x=struct_df['Месяц'], y=struct_df[cat],
-                            marker_color=palette[cat],
-                            text=[f'{v:.1f}%' for v in struct_df[cat]],
-                            textposition='inside',
-                        ))
-                    fig_struct.update_layout(
-                        barmode='stack', height=380,
-                        title='Структура расходов в % выручки помесячно',
-                        yaxis_title='% выручки',
-                        legend=dict(orientation='h', yanchor='bottom', y=1.02),
-                        margin=dict(t=60, b=20),
-                    )
-                    st.plotly_chart(fig_struct, use_container_width=True)
 
         # ── Таб 3: Упущенная прибыль ──
         with tab_lost:
