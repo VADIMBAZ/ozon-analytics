@@ -1279,43 +1279,47 @@ else:
                     'Ниже — сравнение SKU за этот месяц.'
                 )
 
-            # График 1: маржа % линиями (агрегат + по SKU)
-            fig_margin = make_subplots(specs=[[{'secondary_y': True}]])
+            # График 1: маржа % агрегатом + multiselect для подсветки SKU
             agg_by_month = unit_month.groupby(['period_start', 'month_label']).agg({
                 'Выручка': 'sum', 'Прибыль чистая': 'sum'
             }).reset_index().sort_values('period_start')
             agg_by_month['Маржа %'] = (agg_by_month['Прибыль чистая']
                                        / agg_by_month['Выручка'].replace(0, pd.NA)) * 100
 
-            fig_margin.add_trace(
-                go.Scatter(
-                    x=agg_by_month['month_label'], y=agg_by_month['Маржа %'],
-                    mode='lines+markers', name='Маржа (агрегат) %',
-                    line=dict(color='#2c3e50', width=3),
-                    marker=dict(size=10),
-                ),
-                secondary_y=False,
+            sku_with_unit = [a for a in selected_sorted
+                             if a in unit_month['Артикул'].values]
+            highlight_sku = st.multiselect(
+                'Подсветить SKU на графике (опционально)',
+                options=sku_with_unit, default=[],
+                key='unit_margin_highlight',
+                help='Пусто → только линия агрегата. Выбери 1–3 артикула, '
+                     'чтобы сравнить их с агрегатом. Детальное сравнение всех SKU — в heatmap ниже.',
             )
-            for art in selected_sorted:
+
+            fig_margin = go.Figure()
+            fig_margin.add_trace(go.Scatter(
+                x=agg_by_month['month_label'], y=agg_by_month['Маржа %'],
+                mode='lines+markers', name='Маржа (агрегат) %',
+                line=dict(color='#2c3e50', width=3),
+                marker=dict(size=10),
+            ))
+            for art in highlight_sku:
                 art_data = unit_month[unit_month['Артикул'] == art].sort_values('period_start')
                 if art_data.empty:
                     continue
-                fig_margin.add_trace(
-                    go.Scatter(
-                        x=art_data['month_label'], y=art_data['Маржа %'],
-                        mode='lines+markers', name=art,
-                        line=dict(color=ARTICLE_COLOR.get(art, '#999'), width=1.5, dash='dot'),
-                        marker=dict(size=6), opacity=0.7,
-                    ),
-                    secondary_y=False,
-                )
+                fig_margin.add_trace(go.Scatter(
+                    x=art_data['month_label'], y=art_data['Маржа %'],
+                    mode='lines+markers', name=art,
+                    line=dict(color=ARTICLE_COLOR.get(art, '#999'), width=2),
+                    marker=dict(size=8),
+                ))
             fig_margin.update_layout(
                 title='Маржа чистая % по месяцам',
                 height=380, hovermode='x unified',
-                legend=dict(orientation='h', yanchor='bottom', y=1.02),
-                margin=dict(t=60, b=20),
+                yaxis_title='Маржа %',
+                legend=dict(orientation='h', yanchor='top', y=-0.15),
+                margin=dict(t=50, b=80),
             )
-            fig_margin.update_yaxes(title_text='Маржа %', secondary_y=False)
             st.plotly_chart(fig_margin, use_container_width=True)
 
             # График 2: прибыль ₽ стек-баром
@@ -1331,11 +1335,11 @@ else:
                 ))
             fig_profit.update_layout(
                 title='Прибыль чистая ₽ по месяцам (стек по SKU)',
-                barmode='stack', height=380,
+                barmode='stack', height=420,
                 yaxis_title='Прибыль ₽',
                 hovermode='x unified',
-                legend=dict(orientation='h', yanchor='bottom', y=1.02),
-                margin=dict(t=60, b=20),
+                legend=dict(orientation='h', yanchor='top', y=-0.15),
+                margin=dict(t=50, b=100),
             )
             st.plotly_chart(fig_profit, use_container_width=True)
 
