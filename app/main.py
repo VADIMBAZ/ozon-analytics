@@ -1092,62 +1092,66 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Рендер карточек по 3 в ряд
-for row_start in range(0, len(sorted_cards), 3):
-    row_cards = sorted_cards[row_start:row_start + 3]
-    cols = st.columns(3)
-    for idx, (art, data) in enumerate(row_cards):
-        with cols[idx]:
-            months = data['months']
-            # Нижние пороги критичнее перезатарки: пустой склад блокирует продажи,
-            # а перезатарка — только замораживает деньги. Поэтому порядок: стокаут → норма → перезатарка.
-            if months < 0.5:
-                bar_color = '#c0392b'
-                status = 'Стокаут'
-                status_color = '#c0392b'
-            elif months < 1:
-                bar_color = '#e67e22'
-                status = 'Заканчивается'
-                status_color = '#e67e22'
-            elif months <= 3:
-                bar_color = '#2ecc71'
-                status = 'Норма'
-                status_color = '#2ecc71'
-            elif months <= 6:
-                bar_color = '#f39c12'
-                status = 'Избыток'
-                status_color = '#e67e22'
-            else:
-                bar_color = '#e74c3c'
-                status = 'Перезатарка'
-                status_color = '#e74c3c'
+# Рендер карточек по 3 в ряд — внутри сворачиваемого блока,
+# чтобы при первой загрузке дашборда экран не занимали 12 карточек.
+# Сводка-шапка выше (всего на складе / розница / с/с / наценка) остаётся видна всегда.
+with st.expander(f'📦 Карточки артикулов ({len(sorted_cards)} шт) — подробно по каждому SKU',
+                 expanded=False):
+    for row_start in range(0, len(sorted_cards), 3):
+        row_cards = sorted_cards[row_start:row_start + 3]
+        cols = st.columns(3)
+        for idx, (art, data) in enumerate(row_cards):
+            with cols[idx]:
+                months = data['months']
+                # Нижние пороги критичнее перезатарки: пустой склад блокирует продажи,
+                # а перезатарка — только замораживает деньги. Поэтому порядок: стокаут → норма → перезатарка.
+                if months < 0.5:
+                    bar_color = '#c0392b'
+                    status = 'Стокаут'
+                    status_color = '#c0392b'
+                elif months < 1:
+                    bar_color = '#e67e22'
+                    status = 'Заканчивается'
+                    status_color = '#e67e22'
+                elif months <= 3:
+                    bar_color = '#2ecc71'
+                    status = 'Норма'
+                    status_color = '#2ecc71'
+                elif months <= 6:
+                    bar_color = '#f39c12'
+                    status = 'Избыток'
+                    status_color = '#e67e22'
+                else:
+                    bar_color = '#e74c3c'
+                    status = 'Перезатарка'
+                    status_color = '#e74c3c'
 
-            bar_pct = min(months / 15 * 100, 100)
-            img = ARTICLE_IMAGES.get(art, '')
+                bar_pct = min(months / 15 * 100, 100)
+                img = ARTICLE_IMAGES.get(art, '')
 
-            st.markdown(
-                f'<div style="border:1px solid #e0e0e0;border-radius:12px;padding:16px;margin-bottom:8px">'
-                f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">'
-                f'<img src="{img}" style="width:56px;height:56px;border-radius:8px;object-fit:cover" onerror="this.style.display=\'none\'">'
-                f'<div>'
-                f'<div style="font-weight:700;font-size:16px">{art}</div>'
-                f'<span style="background:{status_color};color:white;padding:2px 8px;border-radius:10px;font-size:12px">{status}</span>'
-                f'</div>'
-                f'</div>'
-                f'<div style="display:flex;justify-content:space-between;font-size:13px;color:#666;margin-bottom:4px">'
-                f'<span>Остаток: <b>{_fmt(data["stock"])} шт</b></span>'
-                f'<span>Темп: <b>{data["avg"]:.0f} шт/мес</b></span>'
-                f'</div>'
-                f'<div style="background:#f0f0f0;border-radius:6px;height:14px;margin:8px 0;overflow:hidden">'
-                f'<div style="background:{bar_color};height:100%;width:{bar_pct:.0f}%;border-radius:6px"></div>'
-                f'</div>'
-                f'<div style="display:flex;justify-content:space-between;font-size:13px">'
-                f'<span style="color:{status_color};font-weight:600">Запас: {months:.1f} мес</span>'
-                f'<span style="color:#888;text-align:right;font-size:12px">розн. ~{_fmt(data["frozen"])} ₽<br>с/с ~{_fmt(data["frozen_cost"])} ₽</span>'
-                f'</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+                st.markdown(
+                    f'<div style="border:1px solid #e0e0e0;border-radius:12px;padding:16px;margin-bottom:8px">'
+                    f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">'
+                    f'<img src="{img}" style="width:56px;height:56px;border-radius:8px;object-fit:cover" onerror="this.style.display=\'none\'">'
+                    f'<div>'
+                    f'<div style="font-weight:700;font-size:16px">{art}</div>'
+                    f'<span style="background:{status_color};color:white;padding:2px 8px;border-radius:10px;font-size:12px">{status}</span>'
+                    f'</div>'
+                    f'</div>'
+                    f'<div style="display:flex;justify-content:space-between;font-size:13px;color:#666;margin-bottom:4px">'
+                    f'<span>Остаток: <b>{_fmt(data["stock"])} шт</b></span>'
+                    f'<span>Темп: <b>{data["avg"]:.0f} шт/мес</b></span>'
+                    f'</div>'
+                    f'<div style="background:#f0f0f0;border-radius:6px;height:14px;margin:8px 0;overflow:hidden">'
+                    f'<div style="background:{bar_color};height:100%;width:{bar_pct:.0f}%;border-radius:6px"></div>'
+                    f'</div>'
+                    f'<div style="display:flex;justify-content:space-between;font-size:13px">'
+                    f'<span style="color:{status_color};font-weight:600">Запас: {months:.1f} мес</span>'
+                    f'<span style="color:#888;text-align:right;font-size:12px">розн. ~{_fmt(data["frozen"])} ₽<br>с/с ~{_fmt(data["frozen_cost"])} ₽</span>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 st.divider()
