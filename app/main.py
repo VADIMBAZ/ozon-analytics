@@ -536,6 +536,112 @@ def build_insights(sales_df, analytics_df, selected_arts):
     return insights
 
 
+def build_unit_insights(unit_df: pd.DataFrame, cost_per_unit: int) -> list[str]:
+    """Авто-наблюдения по юнит-экономике за выбранный период.
+
+    Аналог `build_insights`, но финансовая сторона: лучший/худший месяц по
+    марже, лидер прибыли, главная статья расходов, отрицательная маржа,
+    тренд прибыли и резкие изменения маржи.
+    """
+    insights: list[str] = []
+    if unit_df.empty:
+        return insights
+
+    df = unit_df.copy()
+    df['Чистая_продано'] = df['Доставлено'] - df['Возвращено']
+    df['COGS_итого'] = df['Чистая_продано'] * cost_per_unit
+    df['Прибыль_чистая'] = df['Прибыль за период'] - df['COGS_итого']
+
+    by_month = df.groupby(['period_start', 'month_label']).agg(
+        Выручка=('Выручка', 'sum'),
+        Прибыль=('Прибыль_чистая', 'sum'),
+        Synth=('is_synthesized', 'any'),
+    ).reset_index().sort_values('period_start').reset_index(drop=True)
+    by_month['Маржа'] = by_month['Прибыль'] / by_month['Выручка'].replace(0, pd.NA) * 100
+
+    # 1, 2. Лучший / худший месяц по марже
+    if len(by_month) > 1:
+        for label, idx_func, emoji, txt in [
+            ('Лучший месяц по марже', by_month['Маржа'].idxmax, '🏆', 'maxim'),
+            ('Худший месяц по марже', by_month['Маржа'].idxmin, '📉', 'minim'),
+        ]:
+            row = by_month.loc[idx_func()]
+            flag = ' (⚠️ экстраполировано)' if row['Synth'] else ''
+            insights.append(
+                f"{emoji} **{label}**: {row['month_label']} — {row['Маржа']:.1f}% "
+                f"(выручка {_fmt(row['Выручка'])} ₽){flag}."
+            )
+
+    # 3. Лидер по чистой прибыли
+    by_art = df.groupby('Артикул')['Прибыль_чистая'].sum().sort_values(ascending=False)
+    if not by_art.empty:
+        leader = by_art.index[0]
+        leader_profit = by_art.iloc[0]
+        total = by_art.sum()
+        share = (leader_profit / total * 100) if total > 0 else 0
+        insights.append(
+            f"💰 **Лидер по чистой прибыли**: **{leader}** — {_fmt(leader_profit)} ₽ "
+            f"({share:.0f}% от общей прибыли по выбранным SKU)."
+        )
+
+    # 4. Главная статья расходов
+    total_rev = df['Выручка'].sum()
+    if total_rev > 0:
+        cat_vals = {
+            'Комиссия Озон': -df['Вознаграждение Ozon'].sum() - df['Эквайринг'].sum(),
+            'Логистика': -df[['Логистика', 'Доставка до ПВЗ',
+                              'Обработка отправления', 'Стоимость размещения']].sum().sum(),
+            'Возвраты': -df[['Обработка возврата', 'Обратная логистика']].sum().sum(),
+            'Реклама': -df[['Оплата за клик', 'Оплата за заказ']].sum().sum(),
+        }
+        top_name, top_val = max(cat_vals.items(), key=lambda kv: kv[1])
+        insights.append(
+            f"💸 **Главная статья расходов**: {top_name} — "
+            f"{top_val/total_rev*100:.1f}% выручки ({_fmt(top_val)} ₽)."
+        )
+
+    # 5. Отрицательная маржа по (SKU, месяц)
+    df['_m'] = df['Прибыль_чистая'] / df['Выручка'].replace(0, pd.NA) * 100
+    neg = df[df['_m'] < 0].sort_values('_m')
+    if not neg.empty:
+        items = [f"{r['Артикул']} в {r['month_label']} ({r['_m']:.1f}%)"
+                 for _, r in neg.head(3).iterrows()]
+        more = f', и ещё {len(neg) - 3}' if len(neg) > 3 else ''
+        insights.append(
+            f"🚨 **Отрицательная маржа**: " + ', '.join(items) + more
+            + ' — товар работал в минус.'
+        )
+
+    # 6. Тренд прибыли (первый vs последний месяц)
+    if len(by_month) >= 2:
+        first, last = by_month.iloc[0], by_month.iloc[-1]
+        diff = last['Прибыль'] - first['Прибыль']
+        pct = (diff / first['Прибыль'] * 100) if first['Прибыль'] > 0 else 0
+        emoji = '📈' if diff > 0 else '📉'
+        direction = 'рост' if diff > 0 else 'падение'
+        insights.append(
+            f"{emoji} **Тренд прибыли**: {first['month_label']} → {last['month_label']} — "
+            f"{_fmt(first['Прибыль'])} → {_fmt(last['Прибыль'])} ₽ "
+            f"({direction} {pct:+.0f}%)."
+        )
+
+    # 7. Резкое изменение маржи между соседними месяцами (≥ 10 пп)
+    if len(by_month) >= 2:
+        deltas = by_month['Маржа'].diff().abs()
+        if not deltas.dropna().empty:
+            i = int(deltas.idxmax())
+            if i > 0 and deltas.iloc[i] >= 10:
+                prev, curr = by_month.iloc[i - 1], by_month.iloc[i]
+                chg = curr['Маржа'] - prev['Маржа']
+                title, emoji = ('Резкое падение', '⚠️') if chg < 0 else ('Резкий рост', '✨')
+                insights.append(
+                    f"{emoji} **{title} маржи**: {prev['month_label']} → {curr['month_label']} — "
+                    f"{prev['Маржа']:.0f}% → {curr['Маржа']:.0f}% ({chg:+.1f} пп)."
+                )
+
+    return insights
+
+
 with st.expander('💡 Аналитические наблюдения', expanded=True):
     insights = build_insights(sales_period, analytics_period, selected)
     if insights:
@@ -1244,6 +1350,15 @@ else:
             _notes = sorted(set(zip(_synth['month_label'], _synth['source_note'])))
             for ml, note in _notes:
                 st.caption(f'⚠️ **{ml}** — {note}. Маржа и расходы могут быть смещены на ±5–10 пп.')
+
+        # Авто-наблюдения по юнит-экономике — аналогично основному дашборду.
+        with st.expander('💡 Аналитические наблюдения', expanded=True):
+            unit_insights = build_unit_insights(unit_sel, cost_per_unit)
+            if unit_insights:
+                for note in unit_insights:
+                    st.markdown(f'- {note}')
+            else:
+                st.markdown('_Нет данных для анализа._')
 
         st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
 
