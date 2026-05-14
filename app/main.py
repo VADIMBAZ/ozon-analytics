@@ -1322,27 +1322,26 @@ else:
             )
             st.plotly_chart(fig_margin, use_container_width=True)
 
-            # График 2: чистая прибыль ₽ по месяцам — один бар на месяц,
-            # сумма подписана сверху. Детализация по SKU — в heatmap ниже.
-            profit_by_month = (
-                unit_month.groupby(['period_start', 'month_label'])['Прибыль чистая']
-                .sum().reset_index().sort_values('period_start')
-            )
-            fig_profit = go.Figure(go.Bar(
-                x=profit_by_month['month_label'],
-                y=profit_by_month['Прибыль чистая'],
-                marker_color='#27ae60',
-                text=[f'{v:,.0f} ₽'.replace(',', ' ') for v in profit_by_month['Прибыль чистая']],
-                textposition='outside',
-                textfont=dict(size=12),
-                hovertemplate='%{x}<br>Прибыль: %{y:,.0f} ₽<extra></extra>',
-            ))
+            # График 2: прибыль ₽ — сгруппированные бары (как «Остатки»):
+            # каждая группа на оси X = месяц, внутри — бары по SKU своих цветов.
+            fig_profit = go.Figure()
+            for art in selected_sorted:
+                art_data = unit_month[unit_month['Артикул'] == art].sort_values('period_start')
+                if art_data.empty:
+                    continue
+                fig_profit.add_trace(go.Bar(
+                    name=art,
+                    x=art_data['month_label'],
+                    y=art_data['Прибыль чистая'],
+                    marker_color=ARTICLE_COLOR.get(art, '#999'),
+                ))
             fig_profit.update_layout(
-                title='Прибыль чистая ₽ по месяцам',
-                height=380,
+                title='Прибыль чистая ₽ по месяцам (по артикулам)',
+                barmode='group', height=420,
                 yaxis_title='Прибыль ₽',
-                margin=dict(t=50, b=30),
-                showlegend=False,
+                hovermode='x unified',
+                legend=dict(orientation='h', yanchor='top', y=-0.15),
+                margin=dict(t=50, b=100),
             )
             st.plotly_chart(fig_profit, use_container_width=True)
 
